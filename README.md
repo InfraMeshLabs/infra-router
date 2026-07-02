@@ -1,18 +1,18 @@
 # Infra Router
 
-> The AI-native decision engine of InfraMesh.
+> The AI-native orchestration engine of InfraMesh.
 
-Infra Router is an intelligent orchestration engine that determines **how AI requests should be executed** across the InfraMesh network.
+Infra Router is responsible for analyzing incoming requests, building execution plans, and coordinating distributed Workers across the InfraMesh network.
 
-Unlike traditional API gateways or load balancers, Infra Router can leverage AI reasoning to analyze incoming requests, select the most appropriate execution strategy, and coordinate one or more Workers.
+Unlike traditional API gateways or load balancers, Infra Router does not simply forward requests. It reasons about the user's intent, determines how a request should be executed, and orchestrates one or more Workers to complete the task.
 
-The Router itself does **not execute inference**. Instead, it decides **who should execute the request, how it should be executed, and in what order.**
+The Router does **not execute AI inference** itself. Instead, it builds execution plans and delegates execution to Workers.
 
 ---
 
 # Overview
 
-InfraMesh separates management, orchestration, and execution into independent components.
+InfraMesh separates infrastructure management, orchestration, and execution into independent components.
 
 ```
                  +----------------------+
@@ -20,14 +20,14 @@ InfraMesh separates management, orchestration, and execution into independent co
                  |    Control Plane     |
                  +----------+-----------+
                             |
-                    Configuration
+                  Configuration & Metadata
                             |
                  +----------v-----------+
                  |    Infra Router      |
-                 | AI Decision Engine   |
+                 | AI Orchestrator      |
                  +----------+-----------+
                             |
-          Reasoning & Execution Planning
+                    Execution Planning
                             |
        +--------------------+--------------------+
        |                                         |
@@ -36,11 +36,11 @@ InfraMesh separates management, orchestration, and execution into independent co
 +-------------+                           +-------------+
 ```
 
-The Console manages infrastructure.
+Each component has a single responsibility.
 
-The Router makes decisions.
-
-Workers execute inference.
+- Console manages infrastructure.
+- Router builds execution plans.
+- Workers execute AI inference.
 
 ---
 
@@ -48,123 +48,120 @@ Workers execute inference.
 
 Infra Router is responsible for:
 
-- Understanding incoming requests
+- Understanding user intent
+- Building execution plans
+- Discovering available Workers
 - Selecting the most appropriate Worker
-- Choosing execution strategies
 - Coordinating multiple Workers
-- AI-assisted routing
+- Orchestrating execution workflows
+- Aggregating responses
+- Recovering from Worker failures
 - Streaming orchestration
-- Session orchestration
-- Failure recovery
-- Request aggregation
-- Workflow execution
 
-The Router is the intelligence layer of InfraMesh.
+The Router is the orchestration layer of InfraMesh.
 
 ---
 
-# AI-Native Routing
+# AI-Native Orchestration
 
-Unlike traditional routers, Infra Router can use AI to determine where requests should go.
+The Router reasons about every incoming request before deciding how it should be executed.
 
 Example:
 
 ```
 User
 
-"Review this Spring Boot code."
+"Spring AI가 뭐야?"
 ```
 
-The Router reasons:
+The Router may reason like this:
 
 ```
-This is a coding request.
+Programming question
 
 ↓
 
-Use Coding Worker.
+Knowledge request
 
 ↓
 
-GPT-5 is preferred.
+Coding group
 
 ↓
 
-Worker #3 has the lowest load.
+Search required?
 
 ↓
 
-Forward request.
+No
+
+↓
+
+Select best Coding Worker
+
+↓
+
+Execute
 ```
 
-The decision is not hardcoded.
+The execution plan is generated dynamically.
 
-It is generated dynamically.
+No routing rules need to be hardcoded.
 
 ---
 
 # Execution Planning
 
-A request is not always executed by a single Worker.
+Worker selection is only one part of the planning process.
 
-Example:
+A complete execution plan may look like this:
 
 ```
-User
+Incoming Request
 
 ↓
 
-Router
+Intent Analysis
 
 ↓
 
-Reasoning
+Execution Planning
 
+↓
+
+Task A
 ↓
 
 Worker A
-(Code Analysis)
 
+Task B
 ↓
 
 Worker B
-(Security Review)
 
+Task C
 ↓
 
 Worker C
-(Summary)
 
 ↓
 
-Merged Response
+Merge Results
+
+↓
+
+Return Response
 ```
 
-The Router can build execution pipelines depending on the request.
+Simple requests may require only one Worker.
 
----
-
-# Router Intelligence
-
-The Router may consider:
-
-- Request intent
-- User-defined groups
-- Worker capabilities
-- Supported AI models
-- Current workload
-- Worker health
-- Execution cost
-- Latency
-- Custom routing policies
-
-Routing decisions are not limited to simple load balancing.
+Complex requests may involve multiple Workers working together.
 
 ---
 
 # Worker Discovery
 
-Workers advertise their capabilities.
+Workers periodically publish their capabilities.
 
 Example:
 
@@ -172,70 +169,56 @@ Example:
 [
   {
     "workerId": "worker-1",
-    "group": "coding",
+    "groups": [
+      "coding",
+      "review"
+    ],
     "models": [
       "gpt-5"
-    ]
+    ],
+    "streaming": true,
+    "priority": 100
   },
   {
     "workerId": "worker-2",
-    "group": "translation",
+    "groups": [
+      "translation"
+    ],
     "models": [
       "gemini-2.5-pro"
-    ]
+    ],
+    "streaming": true,
+    "priority": 50
   }
 ]
 ```
 
-The Router selects Workers based on capabilities rather than static configuration.
+The Router uses these capabilities when generating execution plans.
 
 ---
 
-# AI-assisted Routing
+# Planning Model
 
-Infra Router can use an AI model to assist routing decisions.
+Infra Router uses a configurable AI model to assist planning.
 
-Example:
+The planning model may determine:
 
-```
-Incoming Request
+- User intent
+- Required Worker groups
+- Execution order
+- Parallel execution opportunities
+- Model preferences
+- Workflow complexity
 
-↓
-
-Router AI
-
-↓
-
-Determine task type
-
-↓
-
-coding
-
-↓
-
-Determine best Worker
-
-↓
-
-Worker #3
-
-↓
-
-Execute
-```
-
-Organizations may:
-
-- Use the default Router AI
-- Configure their own AI model
-- Build a custom Router implementation
+Organizations are free to choose the planning model that best fits their needs.
 
 ---
 
 # Multi-Worker Orchestration
 
-Some requests require multiple Workers.
+Some requests require collaboration between multiple Workers.
+
+Example:
 
 ```
 User Request
@@ -244,7 +227,7 @@ User Request
 
         ▼
 
-AI Router
+Execution Plan
 
         │
 
@@ -258,7 +241,11 @@ Worker Worker Worker
  └──────┼────────┘
         ▼
 
-Merged Response
+Response Aggregation
+
+        ▼
+
+Return
 ```
 
 The Router coordinates the entire workflow.
@@ -267,17 +254,19 @@ The Router coordinates the entire workflow.
 
 # Extensibility
 
-Infra Router is designed to be extensible.
+Infra Router is fully extensible.
 
-Users may:
+Organizations may:
 
-- Replace the routing engine
-- Use a different AI model
-- Add custom routing policies
-- Implement organization-specific logic
-- Create entirely custom Routers
+- Use the default Router implementation
+- Configure different planning models
+- Implement custom planning strategies
+- Extend execution planning
+- Replace orchestration logic entirely
 
-InfraMesh defines the communication protocol—not the routing implementation.
+InfraMesh defines the communication protocol.
+
+How execution plans are generated is entirely implementation-specific.
 
 ---
 
@@ -309,7 +298,7 @@ Authentication
 
         ▼
 
-AI Reasoning
+Intent Analysis
 
         │
 
@@ -321,13 +310,19 @@ Execution Planning
 
         ▼
 
+Worker Discovery
+
+        │
+
+        ▼
+
 Worker Selection
 
         │
 
         ▼
 
-Inference Execution
+Workflow Orchestration
 
         │
 
@@ -342,7 +337,7 @@ Response Aggregation
 Streaming Response
 ```
 
-Every stage can be customized.
+Each stage can be customized or replaced.
 
 ---
 
@@ -351,14 +346,14 @@ Every stage can be customized.
 Infra Router follows several core principles.
 
 - AI-Native
-- Decision Driven
+- Orchestration First
+- Execution Planning
 - Protocol First
 - Vendor Neutral
 - Extensible
 - Stateless
-- Horizontally Scalable
 - Independent Deployment
-- Multi-Worker Orchestration
+- Horizontally Scalable
 - Streaming First
 
 ---
@@ -367,12 +362,11 @@ Infra Router follows several core principles.
 
 Planned capabilities include:
 
-- Planner-based execution
+- Planner optimization
 - Multi-agent orchestration
-- AI-powered routing optimization
-- Cost-aware planning
-- Model fallback strategies
+- Cost-aware execution planning
 - Distributed execution graphs
+- Dynamic Worker learning
 - Routing plugins
 - Workflow templates
 - Observability integration
@@ -385,7 +379,7 @@ Planned capabilities include:
 | Project | Description |
 |----------|-------------|
 | infra-console | Control Plane |
-| infra-router | AI Decision Engine |
+| infra-router | AI Orchestration Engine |
 | infra-worker | AI Execution Runtime |
 
 ---
