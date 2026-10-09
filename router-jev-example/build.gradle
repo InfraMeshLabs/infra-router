@@ -1,0 +1,44 @@
+plugins {
+    id 'java'
+    id 'org.springframework.boot'
+    id 'io.spring.dependency-management'
+}
+
+dependencyManagement {
+    imports {
+        mavenBom "org.springframework.boot:spring-boot-dependencies:${springBootVersion}"
+    }
+}
+
+dependencies {
+    // InfraMesh Node SDK — Router contract (RoutingRequest/RoutingHints/WorkerCandidate/
+    // RoutingResponse), Node health contract, and common node integration components.
+    implementation 'io.github.inframeshai:inframesh-node:0.1.2'
+
+    // Web Application (servlet stack)
+    implementation 'org.springframework.boot:spring-boot-starter-webmvc'
+
+    // WebClient only - not spring-boot-starter-webflux, which would also try to stand up
+    // a reactive server and conflict with the servlet stack above. This starter brings the
+    // WebClient API/autoconfiguration and its HTTP engine without a reactive server. No
+    // Spring AI / LLM SDK on purpose - the Jev API is called directly over HTTP (see JevClient).
+    implementation 'org.springframework.boot:spring-boot-starter-webclient'
+
+    compileOnly 'org.projectlombok:lombok'
+    annotationProcessor 'org.projectlombok:lombok'
+
+    testImplementation 'org.springframework.boot:spring-boot-starter-test'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
+
+tasks.withType(Test).configureEach {
+    useJUnitPlatform()
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.compilerArgs << '-parameters'
+}
+
+springBoot {
+    mainClass = 'koboolean.jevrouter.JevRouterApplication'
+}

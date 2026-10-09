@@ -1,0 +1,15 @@
+pluginManagement {
+    def springBootVersion = providers.gradleProperty("springBootVersion").get()
+    def dependencyManagementVersion = providers.gradleProperty("dependencyManagementVersion").get()
+
+    plugins {
+        id 'org.springframework.boot' version springBootVersion
+        id 'io.spring.dependency-management' version dependencyManagementVersion
+    }
+}
+
+rootProject.name = 'infra-router'
+
+include 'router-spring-ai-example'
+include 'router-static-example'
+include 'router-jev-example'

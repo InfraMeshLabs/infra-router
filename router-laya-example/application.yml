@@ -1,0 +1,44 @@
+# router-laya-example configuration. Override the file location with ROUTER_CONFIG.
+#
+# Inbound authentication for /api/v1/* (X-Infra-Api-Key).
+# The key itself is NOT configured here: set INFRA_NODE_API_KEY (the node API key issued
+# by Infra Console). Never commit a real key.
+# With enabled: true and no key, the Router refuses to start. Authentication is only ever
+# turned off explicitly - enabled: false here, or SECURITY_ENABLED=false - and only in a
+# trusted development environment.
+security:
+  enabled: true
+
+router:
+  laya:
+    # STRICT   - no Worker satisfies the tier Laya asked for -> 422.
+    # FALLBACK - no Worker satisfies it -> use the highest tier that is available.
+    # Override with ROUTER_LAYA_FALLBACK_POLICY.
+    fallback-policy: FALLBACK
+
+    # Tier of a model that matches no rule below, and of a Worker reporting no models.
+    default-tier: small
+
+    # Model -> capability tier, matched case-insensitively against ModelInfo.modelName;
+    # the first matching rule wins. A Worker's tier is the highest tier among its models.
+    #
+    # Map the models your Workers actually serve, one by one. Capability is a judgement
+    # about a specific model, not something its parameter count decides - the entries
+    # below are examples of the format, not a recommendation. (A pattern may contain glob
+    # wildcards, e.g. "my-finetune-*", for model families you have assessed as a whole.)
+    model-capabilities:
+      - pattern: "gemma3:4b"
+        tier: small
+      - pattern: "qwen3:8b"
+        tier: medium
+      - pattern: "qwen3:32b"
+        tier: powerful
+
+    # Load Score weights used to pick among Workers of the same tier. Same metrics,
+    # normalization and defaults as router-static-example; must sum to 1.0.
+    weights:
+      request-count: 0.30
+      queue-size: 0.25
+      latency: 0.20
+      gpu-usage: 0.15
+      vram-usage: 0.10

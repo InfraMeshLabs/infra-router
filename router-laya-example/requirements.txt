@@ -1,0 +1,11 @@
+# Runtime
+laya>=0.3.29,<0.4
+fastapi
+uvicorn[standard]
+pydantic
+pyyaml
+psutil
+
+# Test
+pytest
+httpx

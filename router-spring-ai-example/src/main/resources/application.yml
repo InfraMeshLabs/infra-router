@@ -1,0 +1,17 @@
+server:
+  port: 8090
+infra:
+  node:
+    api-key: c7a367cb-2b05-4a44-b70d-01a34690e8aa
+
+spring:
+  ai:
+    model:
+      chat: ollama
+    ollama:
+      base-url: http://localhost:11434
+      chat:
+        model: gemma4:e4b
+        temperature: 0.0
+  application:
+    name: infra-router

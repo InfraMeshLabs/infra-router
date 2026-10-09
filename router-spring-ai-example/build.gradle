@@ -1,0 +1,43 @@
+plugins {
+    id 'java'
+    id 'org.springframework.boot'
+    id 'io.spring.dependency-management'
+}
+
+dependencyManagement {
+    imports {
+        mavenBom "org.springframework.boot:spring-boot-dependencies:${springBootVersion}"
+        mavenBom "org.springframework.ai:spring-ai-bom:${springAiVersion}"
+    }
+}
+
+dependencies {
+    // InfraMesh Node SDK — Router contract (RoutingRequest/RoutingHints/WorkerCandidate/
+    // RoutingResponse), Node health contract, and common node integration components.
+    implementation 'io.github.inframeshai:inframesh-node:0.1.2'
+
+    // Web Application
+    implementation 'org.springframework.boot:spring-boot-starter-webmvc'
+
+    // AI-native Worker selection — the routing decision itself is made by prompting a
+    // chat model with the request and Worker candidates (see AiRouterServiceImpl).
+    implementation 'org.springframework.ai:spring-ai-starter-model-ollama'
+
+    compileOnly 'org.projectlombok:lombok'
+    annotationProcessor 'org.projectlombok:lombok'
+
+    testImplementation 'org.springframework.boot:spring-boot-starter-test'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
+
+tasks.withType(Test).configureEach {
+    useJUnitPlatform()
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.compilerArgs << '-parameters'
+}
+
+springBoot {
+    mainClass = 'koboolean.router.InfraRouterApplication'
+}

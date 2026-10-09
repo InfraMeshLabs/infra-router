@@ -27,6 +27,260 @@ This repository serves as an **example and starting point** for implementing cus
 
 ---
 
+# Modules
+
+`infra-router` provides **four independent reference Router implementations**, all built on
+the same `infra-node` protocol (`RoutingRequest` / `RoutingHints` / `WorkerCandidate` /
+`RoutingResponse`). Console talks to any of them the same way — it does not need to know
+which implementation, or which language, is behind the endpoint.
+
+Three are modules of the multi-module Gradle project; `router-laya-example` is a standalone
+Python application that lives in the same repository but is not a Gradle subproject.
+
+| Example | Runtime | Description |
+|---|---|---|
+| `router-static-example` | Java / Spring Boot | Static routing example |
+| `router-spring-ai-example` | Java / Spring Boot | Spring AI based routing example |
+| `router-jev-example` | Java / Spring Boot | Jev based routing example |
+| `router-laya-example` | Python / FastAPI | Laya based semantic routing example |
+
+```text
+infra-router
+│
+├── router-spring-ai-example
+│   Spring AI + Local AI based routing example
+│   → Worker selection is delegated to a chat model.
+│
+├── router-static-example
+│   Deterministic metric-based routing example
+│   → Worker selection is a configurable weighted score
+│     over Worker runtime metrics. No AI / LLM dependency.
+│
+├── router-jev-example
+│   Jev typed-decision based routing example
+│   → Worker selection is a single Choice decision from
+│     the Jev (TypeSafe AI) API. No Spring AI dependency.
+│
+└── router-laya-example
+    Laya semantic routing example (Python / FastAPI)
+    → Laya judges request complexity; a deterministic
+      selector maps it to a Worker. Not a Gradle module.
+```
+
+## router-spring-ai-example
+
+```text
+RoutingRequest
+       ↓
+Worker candidates + request context
+       ↓
+Local AI (Spring AI + Ollama)
+       ↓
+AI judges the best Worker
+       ↓
+RoutingResponse
+```
+
+Good for showing request-context-aware routing: the model can reason about request intent,
+model/provider constraints, and Worker runtime state together.
+
+Run it:
+
+```bash
+./gradlew :router-spring-ai-example:bootRun
+```
+
+It listens on port `8090` and requires a local Ollama runtime (see `application.yml` in the
+module for the model/host configuration).
+
+## router-static-example
+
+```text
+RoutingRequest
+       ↓
+Worker Runtime Metrics
+       ↓
+Deterministic Weighted Score
+       ↓
+Lowest-load Worker selected
+       ↓
+RoutingResponse
+```
+
+No LLM, no Spring AI dependency, fast and fully predictable. Good as a lightweight default
+or as a fallback reference when an AI runtime is unavailable.
+
+Run it:
+
+```bash
+./gradlew :router-static-example:bootRun
+```
+
+It listens on port `8091`.
+
+### Static Router scoring
+
+The Static Router computes a **Load Score** from five Worker runtime metrics:
+`currentRequestCount`, `queueSize`, `averageLatency`, `gpuUsage`, `vramUsage`. Each metric
+is normalized to a `0.0–1.0` range, then combined with a configurable weight. **The Worker
+with the lowest score is selected** — a low score means more spare capacity.
+
+- `currentRequestCount`, `queueSize`, `averageLatency` have no fixed maximum, so they are
+  normalized relative to the highest value among the current candidate set.
+- `gpuUsage`, `vramUsage` are already reported as a `0–100` percentage, so they are
+  normalized by dividing by `100`.
+- A metric that is `null` for a Worker (most commonly `gpuUsage`/`vramUsage` on a CPU-only
+  Worker) is excluded from that Worker's score, and its weight is redistributed
+  proportionally across that Worker's remaining available metrics — a missing metric is
+  never defaulted to `0`, which would otherwise make a Worker look artificially better
+  just because it doesn't report a metric.
+- Ties (including "no metric available at all") are broken deterministically: lowest score
+  → lowest `queueSize` → lowest `currentRequestCount` → lowest `averageLatency` → lowest
+  `workerId`. There is no random tie-break, so identical input always produces the same
+  routing decision.
+
+Weights are configured in `router-static-example/src/main/resources/application.yml`
+instead of being hardcoded, and must sum to `1.0` (validated at startup):
+
+```yaml
+router:
+  static:
+    weights:
+      request-count: 0.30
+      queue-size: 0.25
+      latency: 0.20
+      gpu-usage: 0.15
+      vram-usage: 0.10
+```
+
+`RoutingHints` are still respected before scoring: `requiredProvider`, `gpuRequired` and
+`privateData` are hard filters (a Worker that fails one is removed from candidates, and
+routing fails with `422` if no candidate remains), while `preferredModel` is a soft
+preference that only narrows the candidate set when at least one remaining candidate
+actually supports that model.
+
+## router-jev-example
+
+```text
+RoutingRequest
+       ↓
+RoutingHints filtering (Java)
+       ↓
+Eligible Workers → Jev Choice question
+       ↓
+Jev API (typed decision)
+       ↓
+Chosen Worker validated against candidates
+       ↓
+RoutingResponse
+```
+
+[Jev](https://docs.typesafe.ai) is TypeSafe AI's "System One" model: instead of generating
+text, it answers typed questions (Choice / Score / Noul) over a piece of state and returns
+a selected option with calibrated probabilities and confidence. This Router asks a single
+Choice question — "which of these eligible Workers fits this request best" — with one
+option per eligible candidate (`worker_<id>`) and that candidate's
+`currentRequestCount`/`queueSize`/`averageLatency`/`gpuUsage`/`vramUsage` as state. Jev is
+called directly over HTTP (`POST /v1/systemone`) via `WebClient` — it is not wrapped as a
+Spring AI `ChatModel`, since it isn't a chat/completion model.
+
+Run it:
+
+```bash
+JEV_API_KEY=... ./gradlew :router-jev-example:bootRun
+```
+
+It listens on port `8092`. Configuration (`router-jev-example/src/main/resources/application.yml`):
+
+```yaml
+jev:
+  base-url: ${JEV_BASE_URL:https://api.typesafe.ai}
+  api-key: ${JEV_API_KEY:}
+  model: ${JEV_MODEL:jev-latest}
+  timeout: ${JEV_TIMEOUT:2s}
+```
+
+| Variable | Default | Notes |
+|---|---|---|
+| `JEV_API_KEY` | *(empty)* | Required to actually call Jev. Get one from the [TypeSafe console](https://console.typesafe.ai/keys). Never commit a real key. |
+| `JEV_BASE_URL` | `https://api.typesafe.ai` | Jev API base URL. |
+| `JEV_MODEL` | `jev-latest` | Jev model identifier. |
+| `JEV_TIMEOUT` | `2s` | Hard timeout on the Jev call — Routing must not hang on an external API. |
+
+### Policy split and fallback
+
+Exactly like the other two Router examples, `requiredProvider`, `gpuRequired` and
+`privateData` are enforced as hard filters **in Java, before Jev is ever called**, and
+`preferredModel` is resolved as a soft preference in Java too. Jev is a decision layer over
+already-eligible candidates, never the thing that decides whether a policy is satisfied —
+and its answer is only trusted if it names a Worker that was actually offered.
+
+Jev is an external HTTP call, so it can time out, rate-limit, or fail outright. Rather than
+let a routing decision hang or fail the whole request over a transient API problem, any Jev
+failure (timeout, connection error, non-2xx, unusable response) **or an unrecognized Worker
+choice** falls back to a small deterministic ordering: lowest `queueSize` → lowest
+`currentRequestCount` → lowest `averageLatency` → lowest `workerId`. This is intentionally
+*not* the full weighted/configurable algorithm from `router-static-example` — copying that
+module's scoring here would create two competing sources of truth for the same policy — so
+the fallback here is deliberately minimal, and every fallback is logged at `WARN` rather
+than happening silently.
+
+## router-laya-example
+
+```text
+RoutingRequest
+       ↓
+RoutingHints filtering (Python)
+       ↓
+Last user message → Laya Choice question
+       ↓
+Request tier: small / medium / powerful
+       ↓
+Worker capability tier + Weighted Load Score
+       ↓
+RoutingResponse
+```
+
+[Laya](https://pypi.org/project/laya/) is a local, non-autoregressive decision model
+distributed as a Python library, so this example is a standalone **Python + FastAPI**
+service rather than a Spring Boot module. It implements the same Router protocol itself —
+`POST /api/v1/route`, `GET /api/v1/health`, `X-Infra-Api-Key` — instead of sitting behind a
+Java Router, so Console registers it like any other Router.
+
+Laya only judges how complex the request is. Which Worker serves it is decided in code:
+each Worker's capability tier comes from a configurable model-name mapping, and Workers of
+the same tier are ranked with the same Load Score as `router-static-example`. Worker
+runtime metrics are never handed to Laya.
+
+Run it:
+
+```bash
+cd router-laya-example
+python3 -m venv .venv && source .venv/bin/activate
+python -m pip install -r requirements.txt
+INFRA_NODE_API_KEY=... uvicorn app.main:app --host 0.0.0.0 --port 8093
+```
+
+It listens on port `8093`. Authentication is on by default and startup fails without
+`INFRA_NODE_API_KEY`; it can only be turned off explicitly (`SECURITY_ENABLED=false`). The Laya checkpoint (~846MB) is downloaded on first start and
+loaded during startup warm-up, before the Router accepts requests. See
+[`router-laya-example/README.md`](router-laya-example/README.md) for configuration, Docker,
+the tier fallback policy and known limitations.
+
+None of the four Router implementations is "better" in general — they are reference
+examples of four different routing strategies (local AI, deterministic metrics, an
+external typed-decision API, and a local semantic classifier), and organizations can pick,
+extend, or combine any of these approaches for their own Router nodes.
+
+| Router | Decision |
+|---|---|
+| `router-spring-ai-example` | Local LLM (Spring AI + Ollama) |
+| `router-static-example` | Weighted Worker metrics |
+| `router-jev-example` | Jev typed-decision API (Choice), with deterministic fallback |
+| `router-laya-example` | Laya request-complexity tier, then weighted Worker metrics |
+
+---
+
 # Overview
 
 InfraMesh separates infrastructure management, routing decisions, and inference execution into independent components.
@@ -66,7 +320,7 @@ Each component has a clear responsibility:
 - **Console** manages organizations, teams, nodes, Worker availability, and routing configuration.
 - **Router** analyzes a request and selects one Worker from the candidates provided by Console.
 - **Worker** performs the actual AI inference.
-- **infra-node** defines the common SDK, DTOs, health contracts, authentication integration, and node specifications.
+- **infra-node** defines the common SDK, DTOs, health contracts, authentication integration, node specifications, and the Outbound Connection SDK shared by Routers and Workers.
 
 The Router does **not execute the final AI inference request**.
 
@@ -117,18 +371,22 @@ These include:
 - Node health contracts
 - Authentication support
 - Common node integration components
+- Outbound Connection SDK — the persistent Console connection (WebSocket client, authentication header, heartbeat, reconnect, lifecycle) used in OUTBOUND mode
 
-During local development, `infra-node` may be included as a JAR dependency.
-
-Example:
+`infra-node` is published to Maven Central. The current protocol contract is **`0.1.1`**:
 
 ```gradle
+repositories {
+    mavenCentral()
+}
+
 dependencies {
-    implementation files('libs/infra-node-1.0.0.jar')
+    implementation 'io.github.inframeshai:inframesh-node:0.1.1'
 }
 ```
 
-When repository-based distribution becomes available, this can be replaced with the corresponding repository dependency.
+A Router that is not written in Java (see `router-laya-example`) cannot use the artifact and
+instead mirrors the same `0.1.1` JSON contract field for field.
 
 Custom Router implementations should always use the contracts provided by `infra-node`.
 
@@ -155,9 +413,9 @@ An InfraMesh Router has two primary external capabilities:
 
 ```text
 Router
-├── Health
+├── Health   GET  /api/v1/health
 │
-└── Invoke
+└── Route    POST /api/v1/route
 ```
 
 The Router is responsible for:
@@ -194,9 +452,28 @@ Routers must expose health information so InfraMesh Console can determine whethe
 
 ```http
 GET /api/v1/health
+X-Infra-Api-Key: <NODE_API_KEY>
 ```
 
-The health implementation should use the common health contract provided by `infra-node`.
+A Java Router does not implement this endpoint: `infra-node` auto-configures it
+(`HealthCheckController`) and returns `NodeHealthResponse`:
+
+```json
+{
+  "status": "UP",
+  "system": {
+    "cpu":    { "name": "…", "usage": 12.5 },
+    "memory": { "total": 0, "used": 0, "available": 0 },
+    "gpus":   [ { "index": 0, "name": "…", "usage": 40.0,
+                  "totalMemory": 0, "usedMemory": 0, "availableMemory": 0 } ]
+  },
+  "runtime": { "activeRequests": 0 }
+}
+```
+
+`status` is `UP` or `DOWN`. Usage values are percentages (`0`–`100`), memory values are
+bytes, and `gpus` is empty on a CPU-only node. `runtime.activeRequests` counts Worker
+inference only, so it stays `0` on a Router.
 
 Conceptually:
 
@@ -217,13 +494,20 @@ Custom Router implementations should reuse the health components provided by `in
 
 ---
 
-# Invoke
+# Route
 
-Routing is performed through an invoke-based request.
+Routing is performed through a single route request.
 
 ```http
-POST /api/v1/invoke
+POST /api/v1/route
+X-Infra-Api-Key: <NODE_API_KEY>
 ```
+
+`/route` means "choose a Worker for this request". It is not `POST /api/v1/invoke`, which is
+the **Worker** inference endpoint — a Router never exposes or calls it.
+
+Unlike health, `infra-node` does not provide this endpoint: each Router implements the
+controller itself, under the `/api/v1` prefix so that the SDK's API key filter covers it.
 
 The request uses:
 
@@ -261,7 +545,7 @@ RoutingResponse
 Infra Console
 ```
 
-All routing decisions are completed through this single invoke flow.
+All routing decisions are completed through this single route flow.
 
 ---
 
@@ -309,7 +593,7 @@ Streaming Client Request
           ▼
         Router
           │
-          │ POST /api/v1/invoke
+          │ POST /api/v1/route
           ▼
    RoutingResponse
           │
@@ -334,21 +618,37 @@ The Worker performs the actual streaming inference.
 
 Router requests use the `RoutingRequest` contract provided by `infra-node`.
 
-The exact fields are defined by the version of `infra-node` used by the Router.
-
-A `RoutingRequest` conceptually contains:
+In `infra-node` `0.1.1` a `RoutingRequest` contains:
 
 ```text
 RoutingRequest
-├── Request information
-│   ├── Messages
-│   ├── Chat options
-│   ├── Tool information
-│   └── Other supported request metadata
-│
-├── RoutingHints
-│
-└── WorkerCandidates
+├── sessionId     String, nullable — propagated for context only;
+│                 Session Affinity is owned by Console, not the Router
+├── messages      List<ChatMessage>
+│                   role (SYSTEM | USER | ASSISTANT | TOOL), content,
+│                   toolCalls [ { id, name, arguments } ], toolCallId
+├── options       ChatOptions, nullable — temperature, maxTokens, topP
+├── routing       RoutingHints, nullable
+├── tools         List<ToolDefinition> — name, description, parameters (JSON Schema)
+├── toolChoice    ToolChoice, nullable — mode (AUTO | NONE | REQUIRED | TOOL), toolName
+└── workers       List<WorkerCandidate>
+```
+
+Field names are the JSON property names; enums are sent as their names. A missing or `null`
+`tools` / `workers` list is read as an empty list.
+
+For example:
+
+```json
+{
+  "sessionId": "session-1",
+  "messages": [ { "role": "USER", "content": "Spring AI가 뭐야?" } ],
+  "options": { "temperature": 0.7, "maxTokens": 1024, "topP": null },
+  "routing": { "preferredModel": "qwen3", "requiredProvider": "OLLAMA" },
+  "tools": [],
+  "toolChoice": null,
+  "workers": [ { "workerId": 17, "provider": "OLLAMA", "queueSize": 1 } ]
+}
 ```
 
 The Router should use the actual `RoutingRequest` record provided by the current `infra-node` dependency rather than redefining it locally.
@@ -359,12 +659,10 @@ For example, a Router may consider:
 
 ```text
 Request content
-Requested model
-Provider constraints
 Tool requirements
 Request options
 Routing hints
-Worker capabilities
+Worker models and provider
 Worker runtime state
 ```
 
@@ -376,21 +674,23 @@ The exact routing algorithm remains implementation-specific.
 
 `RoutingHints` represents routing preferences or constraints supplied with an inference request.
 
-The exact contract is defined by `infra-node`.
-
-Typical routing hints may include concepts such as:
+In `infra-node` `0.1.1` the fields are:
 
 ```text
-preferredModel
-requiredModel
-
-preferredProvider
-requiredProvider
-
-requiredCapabilities
+preferredModel         String
+requiredProvider       String
+requiredCapabilities   List<String>   (null is read as an empty list)
+gpuRequired            Boolean
+minimumVramBytes       Long
+privateData            Boolean        (missing / null / false = no restriction)
 ```
 
-depending on the current `infra-node` version.
+Every field is optional. When `privateData` is `true`, the Router must not select a Worker
+that could send the request's data to an `EXTERNAL` AI provider.
+
+`requiredCapabilities` and `minimumVramBytes` are part of the contract, but `WorkerCandidate`
+currently has no capability list and no numeric VRAM capacity to check them against, so none
+of the reference Routers enforce them.
 
 Routing hints should describe **what the request prefers or requires**.
 
@@ -521,40 +821,47 @@ The Router must select a Worker only from the candidates supplied by Console.
 
 # Worker Runtime Information
 
-`WorkerCandidate` can expose Worker capability and runtime information required for routing decisions.
+`WorkerCandidate` exposes the Worker identity, model and runtime information required for routing decisions.
 
-Depending on the current `infra-node` contract, this may include information such as:
+In `infra-node` `0.1.1` the fields are:
 
 ```text
-Framework
-Framework version
+workerId              Long
+name                  String
+description           String
 
-Uptime
+models                List<ModelInfo>   (null is read as an empty list)
+                        provider, modelName,
+                        executionLocation (LOCAL | EXTERNAL, null = unknown)
+provider              String
 
-Current request count
-Queue size
+framework             String
+frameworkVersion      String
 
-Average latency
-Throughput
-Error count
+currentRequestCount   Integer
+queueSize             Integer
+averageLatency        Number
+throughput            Number
+errorCount            Long
 
-CPU
-CPU utilization
+cpu                   String   (description)
+cpuUsage              Number   (0–100 %)
 
-Memory
-Memory utilization
+memory                String   (description)
+memoryUsage           Number   (0–100 %)
 
-GPU
-GPU utilization
+gpu                   String   (description; absent on a CPU-only Worker)
+gpuUsage              Number   (0–100 %)
 
-VRAM
-VRAM utilization
-
-Supported models
-Provider information
+vram                  String   (description such as "32GB", not bytes)
+vramUsage             Number   (0–100 %)
 ```
 
-This allows Router implementations to make decisions using both static capabilities and dynamic runtime state.
+Any field other than `workerId` may be `null` — most commonly `gpu` / `gpuUsage` / `vram` /
+`vramUsage` on a CPU-only Worker — and a Router must not treat a missing metric as `0`.
+An unknown `executionLocation` must be treated as unsafe for `privateData` requests.
+
+This allows Router implementations to make decisions using both the Worker's models and its dynamic runtime state.
 
 For example:
 
@@ -607,17 +914,17 @@ WorkerCandidates
 Worker A
   provider = OLLAMA
   models = [qwen3, gemma3]
-  activeRequests = 2
+  currentRequestCount = 2
 
 Worker B
   provider = VLLM
   models = [qwen3]
-  activeRequests = 0
+  currentRequestCount = 0
 
 Worker C
   provider = OLLAMA
   models = [gemma3]
-  activeRequests = 0
+  currentRequestCount = 0
 
               │
               ▼
@@ -688,7 +995,7 @@ Candidates
 Filter by required provider
     │
     ▼
-Filter by required capabilities
+Filter by gpuRequired / privateData
     │
     ▼
 Prefer requested model
@@ -745,18 +1052,18 @@ An AI-based Router may consider:
 ```text
 Request intent
 Request complexity
-Requested model
+Preferred model
 Provider constraints
 Tool requirements
 
 Worker models
-Worker capabilities
+Worker provider
 
 Current requests
 Queue
 Latency
 Throughput
-Error rate
+Error count
 
 CPU
 Memory
@@ -803,11 +1110,14 @@ The Router implementation remains completely customizable.
 
 The Router returns the common `RoutingResponse` defined by `infra-node`.
 
-Conceptually, the most important result is:
+In `infra-node` `0.1.1` it has exactly one field, the numeric id of the selected Worker:
 
-```text
-selected workerId
+```json
+{ "workerId": 17 }
 ```
+
+Router-specific details (scores, tiers, model output, confidence) are not part of the
+response; they belong in the Router's own logs.
 
 For example:
 
@@ -848,7 +1158,7 @@ workerId = 17
       │
       ▼
 
-RoutingRequest.workerCandidates
+RoutingRequest.workers
 
 [11, 17, 24]
 
@@ -1020,14 +1330,17 @@ The Router only understands the common protocol defined by `infra-node`.
 
 # Router Implementation
 
-This repository provides a reference Router implementation.
+This repository provides four reference Router implementations — `router-spring-ai-example`
+(AI-based), `router-static-example` (deterministic, metric-based), `router-jev-example`
+(Jev typed-decision API), and `router-laya-example` (Laya semantic routing, Python / FastAPI).
+See [Modules](#modules) for details on each.
 
 When building a custom Router, use this project as a reference for:
 
 - `infra-node` integration
 - Router configuration
 - Health endpoint implementation
-- Invoke endpoint implementation
+- Route endpoint implementation
 - `RoutingRequest` handling
 - `RoutingHints` handling
 - `WorkerCandidate` handling
@@ -1064,26 +1377,121 @@ Rule / AI / Score               Any Algorithm
 
 # Authentication
 
-Routers can authenticate requests from InfraMesh Console using node API keys.
-
-Example:
+Routers authenticate DIRECT requests from InfraMesh Console with the node API key.
 
 ```http
 X-Infra-Api-Key: <NODE_API_KEY>
 ```
 
-The API key is issued and managed through Infra Console.
+The API key is issued and managed through Infra Console. In `infra-node` `0.1.1` this is the
+whole mechanism, and it is always on:
 
-Depending on the deployment environment, authentication modes may include:
+- The SDK auto-configures a filter (`NodeApiKeyServletFilter` for servlet applications,
+  `NodeApiKeyFilter` for reactive ones) on every path starting with `/api/v1` — the Router's
+  own `POST /api/v1/route` as well as `GET /api/v1/health`. Other paths are not checked.
+- The key is configured as `infra.node.api-key` and must be a UUID.
+- A request whose `X-Infra-Api-Key` header is missing or does not equal the configured key
+  exactly is rejected with `401` and an empty body.
 
-```text
-API_KEY
-NONE
+```yaml
+infra:
+  node:
+    api-key: ${INFRA_NODE_API_KEY}
 ```
 
-`NONE` should only be used in trusted environments.
+There is no authentication mode setting and no SDK switch to disable the filter.
 
-Custom Router implementations should reuse the authentication support provided by `infra-node` when available instead of defining incompatible authentication protocols.
+OUTBOUND connections do not use the API key: the node authenticates to Console with its
+`nodeId` and `credential` during the WebSocket handshake (see [Connection Mode](#connection-mode)).
+
+Custom Router implementations should reuse the authentication support provided by `infra-node` instead of defining incompatible authentication protocols.
+
+---
+
+# Connection Mode
+
+A Router uses the same connection model and the same `inframesh.node.*` configuration as a Worker. Both modes coexist; OUTBOUND does not replace DIRECT.
+
+```text
+DIRECT (default)
+
+Console ──HTTP──▶ Router          POST /api/v1/route
+
+
+OUTBOUND
+
+Console
+   ▲
+   │ Persistent WebSocket
+   │
+infra-node Connection SDK
+   │
+Router
+```
+
+Responsibilities are split between the two projects:
+
+```text
+infra-node    Common SDK + Connection Infrastructure
+              (WebSocket client, authentication header, heartbeat, reconnect,
+               backoff / jitter, lifecycle, graceful shutdown, NodeEnvelope transport)
+
+infra-router  Router Reference Implementation + Routing Decision
+              (Router REQUEST handler, RoutingRequest analysis, RoutingResponse)
+```
+
+A Router implementer does **not** write a WebSocket client, heartbeat, reconnect, authentication header, or lifecycle code — adding `infra-node` is enough. There is no Router-specific connection module.
+
+OUTBOUND is opt-in. The connection is auto-configured by `infra-node` only when `connection-mode` is `OUTBOUND`; every example module ships it as an `outbound` Spring profile (`src/main/resources/application-outbound.yml`):
+
+```yaml
+inframesh:
+  node:
+    connection-mode: OUTBOUND
+    console-url: ${INFRAMESH_CONSOLE_URL}
+    node-id: ${INFRAMESH_NODE_ID}
+    credential: ${INFRAMESH_NODE_CREDENTIAL}
+```
+
+```bash
+INFRAMESH_CONSOLE_URL=https://console.example.com \
+INFRAMESH_NODE_ID=<uuid> \
+INFRAMESH_NODE_CREDENTIAL=<credential> \
+./gradlew :router-static-example:bootRun --args='--spring.profiles.active=outbound'
+```
+
+Each example registers one Router REQUEST handler that reuses the **same** `RouterService` as DIRECT's `POST /api/v1/route` — only the transport differs:
+
+```java
+@Bean
+public NodeRequestHandler<RoutingRequest, RoutingResponse> outboundRequestHandler(RouterService routerService) {
+    return NodeRequestHandler.of(RoutingRequest.class, routerService::route);
+}
+```
+
+```text
+Console
+   │ NodeEnvelope REQUEST (payload: RoutingRequest, requestId)
+   ▼
+Persistent WebSocket
+   │
+   ▼
+infra-node Connection SDK
+   │
+   ▼
+Router REQUEST Handler
+   │
+   ▼
+RouterService.route        (existing routing decision)
+   │
+   ▼
+infra-node Connection SDK
+   │ NodeEnvelope RESPONSE (payload: RoutingResponse, same requestId) — or ERROR
+   ▼
+Console
+```
+
+> **Current status.** The Router side of this flow is implemented and tested: an OUTBOUND Router authenticates, connects, heartbeats and reconnects through `infra-node`, and answers a `RoutingRequest` REQUEST with a `RoutingResponse` RESPONSE. **Infra Console does not dispatch routing requests over the outbound connection yet** — it only selects DIRECT Routers for the `AI_ROUTER` strategy and calls them over HTTP. Until Console-side dispatch is added, run Routers that must take part in routing in DIRECT mode.
 
 ---
 
@@ -1174,17 +1582,21 @@ Start by adding the `infra-node` dependency to the Router project.
 
 ```gradle
 dependencies {
-    implementation files('libs/infra-node-1.0.0.jar')
+    implementation 'io.github.inframeshai:inframesh-node:0.1.1'
 }
 ```
 
-Then use the example implementation in this repository as a reference.
+Then use one of the example implementations in this repository as a reference — see
+[Modules](#modules) above for `router-spring-ai-example` (AI-based), `router-static-example`
+(deterministic, metric-based), `router-jev-example` (Jev typed-decision API), and
+`router-laya-example` (Laya semantic routing — a Python service that implements the same
+HTTP contract without the Java SDK).
 
 At minimum, a Router should:
 
 1. Integrate `infra-node`.
 2. Provide the Router health endpoint.
-3. Provide `POST /api/v1/invoke`.
+3. Provide `POST /api/v1/route`.
 4. Accept the latest `RoutingRequest`.
 5. Read the provided `WorkerCandidate` list.
 6. Process relevant `RoutingHints`.
@@ -1320,6 +1732,9 @@ Worker contracts
 Health contracts
 Authentication integration
 Node integration specifications
+Outbound Connection SDK
+  (WebSocket client, heartbeat, reconnect,
+   lifecycle, NodeEnvelope transport)
 ```
 
 This separation should remain consistent even for custom Router implementations.

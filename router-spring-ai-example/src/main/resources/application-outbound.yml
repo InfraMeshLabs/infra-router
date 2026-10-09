@@ -1,0 +1,22 @@
+# Activate with --spring.profiles.active=outbound (or SPRING_PROFILES_ACTIVE=outbound).
+# Opts this Router into a persistent outbound WebSocket connection to Console, provided by
+# infra-node's Outbound Connection SDK, instead of the DIRECT (Console-calls-Router) mode used
+# by default. Same inframesh.node.* structure as an OUTBOUND Worker.
+#
+# nodeId/credential come from Node Registration and must never be committed;
+# they are read from environment variables here.
+inframesh:
+  node:
+    connection-mode: OUTBOUND
+    console-url: ${INFRAMESH_CONSOLE_URL}
+    node-id: ${INFRAMESH_NODE_ID}
+    credential: ${INFRAMESH_NODE_CREDENTIAL}
+
+    outbound:
+      heartbeat-interval: 10s
+      # Runtime health (NodeHealthResponse) pushed as HEALTH - separate from the connection
+      # heartbeat above. Common infra-node setting, same as an OUTBOUND Worker.
+      health-interval: 30s
+      reconnect:
+        initial-delay: 1s
+        max-delay: 30s
