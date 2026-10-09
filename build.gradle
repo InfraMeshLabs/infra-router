@@ -1,0 +1,9 @@
+allprojects {
+    group = 'koboolean'
+    version = '1.0-SNAPSHOT'
+
+    repositories {
+        mavenCentral()
+        mavenLocal()
+    }
+}
