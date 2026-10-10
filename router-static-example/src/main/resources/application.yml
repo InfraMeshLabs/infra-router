@@ -1,0 +1,20 @@
+server:
+  port: 8091
+infra:
+  node:
+    api-key: 882684db-f657-4f42-8c17-fe1a1b485c41
+
+
+spring:
+  application:
+    name: infra-router-static
+
+
+router:
+  static:
+    weights:
+      request-count: 0.30
+      queue-size: 0.25
+      latency: 0.20
+      gpu-usage: 0.15
+      vram-usage: 0.10
