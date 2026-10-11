@@ -1,0 +1,1 @@
+주어진 후보 Worker 중에서 이 요청을 처리하기에 가장 적합한 Worker를 선택하세요. currentRequestCount, queueSize, averageLatency, gpuUsage, vramUsage를 포함한 각 Worker의 실행 상태를 종합적으로 고려하고, 하나의 지표만으로 판단하지 마세요. 일반적으로 이 값들이 낮을수록 여유가 있는 Worker입니다.
