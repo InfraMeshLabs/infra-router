@@ -1,0 +1,17 @@
+server:
+  port: 8092
+infra:
+  node:
+    api-key: 0e009b03-345e-4b23-9091-d3f9be20182d
+
+spring:
+  application:
+    name: infra-router-jev
+
+# Jev (TypeSafe AI) typed-decision API - see https://docs.typesafe.ai/api
+# JEV_API_KEY must be set via environment variable; never commit a real key here.
+jev:
+  base-url: ${JEV_BASE_URL:https://api.typesafe.ai}
+  api-key: ${JEV_API_KEY:}
+  model: ${JEV_MODEL:jev-latest}
+  timeout: ${JEV_TIMEOUT:2s}
