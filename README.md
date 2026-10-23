@@ -381,7 +381,7 @@ repositories {
 }
 
 dependencies {
-    implementation 'io.github.inframeshai:inframesh-node:0.1.1'
+    implementation 'io.github.inframeshai:inframesh-node:0.1.4'
 }
 ```
 
@@ -1582,7 +1582,7 @@ Start by adding the `infra-node` dependency to the Router project.
 
 ```gradle
 dependencies {
-    implementation 'io.github.inframeshai:inframesh-node:0.1.1'
+    implementation 'io.github.inframeshai:inframesh-node:0.1.4'
 }
 ```
 
