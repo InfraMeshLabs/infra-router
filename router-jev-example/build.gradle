@@ -13,7 +13,7 @@ dependencyManagement {
 dependencies {
     // InfraMesh Node SDK — Router contract (RoutingRequest/RoutingHints/WorkerCandidate/
     // RoutingResponse), Node health contract, and common node integration components.
-    implementation 'io.github.inframeshai:inframesh-node:0.1.3'
+    implementation 'io.github.inframeshai:inframesh-node:0.1.4'
 
     // Web Application (servlet stack)
     implementation 'org.springframework.boot:spring-boot-starter-webmvc'
