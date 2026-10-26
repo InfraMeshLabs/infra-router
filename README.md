@@ -29,12 +29,12 @@ This repository serves as an **example and starting point** for implementing cus
 
 # Modules
 
-`infra-router` provides **four independent reference Router implementations**, all built on
+`infra-router` provides **five independent reference Router implementations**, all built on
 the same `infra-node` protocol (`RoutingRequest` / `RoutingHints` / `WorkerCandidate` /
 `RoutingResponse`). Console talks to any of them the same way — it does not need to know
 which implementation, or which language, is behind the endpoint.
 
-Three are modules of the multi-module Gradle project; `router-laya-example` is a standalone
+Four are modules of the multi-module Gradle project; `router-laya-example` is a standalone
 Python application that lives in the same repository but is not a Gradle subproject.
 
 | Example | Runtime | Description |
@@ -43,6 +43,7 @@ Python application that lives in the same repository but is not a Gradle subproj
 | `router-spring-ai-example` | Java / Spring Boot | Spring AI based routing example |
 | `router-jev-example` | Java / Spring Boot | Jev based routing example |
 | `router-laya-example` | Python / FastAPI | Laya based semantic routing example |
+| `router-laya-java-example` | Java / Spring Boot | Laya (laya-java, ONNX) based semantic routing example — experimental |
 
 ```text
 infra-router
@@ -61,10 +62,15 @@ infra-router
 │   → Worker selection is a single Choice decision from
 │     the Jev (TypeSafe AI) API. No Spring AI dependency.
 │
-└── router-laya-example
-    Laya semantic routing example (Python / FastAPI)
-    → Laya judges request complexity; a deterministic
-      selector maps it to a Worker. Not a Gradle module.
+├── router-laya-example
+│   Laya semantic routing example (Python / FastAPI)
+│   → Laya judges request complexity; a deterministic
+│     selector maps it to a Worker. Not a Gradle module.
+│
+└── router-laya-java-example
+    Same as router-laya-example, on the JVM (experimental)
+    → laya-java runs Laya in-process through ONNX Runtime.
+      Needs a locally built laya-java snapshot.
 ```
 
 ## router-spring-ai-example
@@ -267,7 +273,25 @@ loaded during startup warm-up, before the Router accepts requests. See
 [`router-laya-example/README.md`](router-laya-example/README.md) for configuration, Docker,
 the tier fallback policy and known limitations.
 
-None of the four Router implementations is "better" in general — they are reference
+## router-laya-java-example
+
+The same Router as `router-laya-example` — same policy, same `router.laya.*` keys, same Laya
+question — on Spring Boot, with [laya-java](https://github.com/NandhaKishorM/laya/tree/main/laya-java)
+running Laya in-process through ONNX Runtime instead of Python.
+
+**Experimental:** laya-java is `0.1.0-SNAPSHOT` and not on Maven Central yet. Its source is
+not part of this repository; build it from the laya repository into `mavenLocal()` and
+prepare the english + multilingual checkpoints/ONNX graphs once, then:
+
+```bash
+LAYA_CHECKPOINTS=... LAYA_ONNX_ROOT=... INFRA_NODE_API_KEY=... \
+  ./gradlew :router-laya-java-example:bootRun
+```
+
+It listens on port `8094`. Until laya-java is installed locally the root `./gradlew build`
+cannot resolve it. See [`router-laya-java-example/README.md`](router-laya-java-example/README.md).
+
+None of the Router implementations is "better" in general — they are reference
 examples of four different routing strategies (local AI, deterministic metrics, an
 external typed-decision API, and a local semantic classifier), and organizations can pick,
 extend, or combine any of these approaches for their own Router nodes.
@@ -278,6 +302,7 @@ extend, or combine any of these approaches for their own Router nodes.
 | `router-static-example` | Weighted Worker metrics |
 | `router-jev-example` | Jev typed-decision API (Choice), with deterministic fallback |
 | `router-laya-example` | Laya request-complexity tier, then weighted Worker metrics |
+| `router-laya-java-example` | Same as `router-laya-example`, with laya-java (ONNX) on the JVM |
 
 ---
 
@@ -1330,9 +1355,10 @@ The Router only understands the common protocol defined by `infra-node`.
 
 # Router Implementation
 
-This repository provides four reference Router implementations — `router-spring-ai-example`
+This repository provides five reference Router implementations — `router-spring-ai-example`
 (AI-based), `router-static-example` (deterministic, metric-based), `router-jev-example`
-(Jev typed-decision API), and `router-laya-example` (Laya semantic routing, Python / FastAPI).
+(Jev typed-decision API), `router-laya-example` (Laya semantic routing, Python / FastAPI) and
+`router-laya-java-example` (the same Laya Router on the JVM, experimental).
 See [Modules](#modules) for details on each.
 
 When building a custom Router, use this project as a reference for:

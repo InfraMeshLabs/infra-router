@@ -1,5 +1,5 @@
 # Runtime
-laya>=0.3.29,<0.4
+laya>=0.4.13,<0.5
 fastapi
 uvicorn[standard]
 pydantic

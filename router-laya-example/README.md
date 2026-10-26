@@ -11,6 +11,11 @@ written in Python.
 Laya is a Python library, so this example is a **Python + FastAPI service**, not a Gradle
 subproject. It is not included in `settings.gradle` and the root Gradle build ignores it.
 
+A JVM version of this Router, built on laya-java (the ONNX port of Laya, not yet on Maven
+Central), lives in [`router-laya-java-example`](../router-laya-java-example) as an
+experimental Gradle module. This Python example remains the reference until laya-java is
+released.
+
 ## Architecture
 
 ```text

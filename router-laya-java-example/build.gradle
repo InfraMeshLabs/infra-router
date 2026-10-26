@@ -1,0 +1,53 @@
+plugins {
+    id 'java'
+    id 'org.springframework.boot'
+    id 'io.spring.dependency-management'
+}
+
+dependencyManagement {
+    imports {
+        mavenBom "org.springframework.boot:spring-boot-dependencies:${springBootVersion}"
+    }
+}
+
+dependencies {
+    // InfraMesh Node SDK — Router contract (RoutingRequest/RoutingHints/WorkerCandidate/
+    // RoutingResponse), Node health contract, and common node integration components.
+    implementation 'io.github.inframeshai:inframesh-node:0.1.4'
+
+    // Web Application
+    implementation 'org.springframework.boot:spring-boot-starter-webmvc'
+
+    // Laya on the JVM (ONNX Runtime inference, no Python at run time). NOT on Maven Central
+    // yet: build it from the laya repository - outside this repository - and install it into
+    // mavenLocal first. See the module README, "Building laya-java".
+    implementation "com.convaiinnovations:laya-java:${layaJavaVersion}"
+
+    compileOnly 'org.projectlombok:lombok'
+    annotationProcessor 'org.projectlombok:lombok'
+
+    testImplementation 'org.springframework.boot:spring-boot-starter-test'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
+
+tasks.withType(Test).configureEach {
+    useJUnitPlatform()
+    // The real-model test (LayaModelIntegrationTest) runs only when these point at a prepared
+    // checkpoint and graph; otherwise it is skipped. Declared as inputs so toggling them
+    // re-runs the suite instead of reusing an up-to-date result from the other mode.
+    ['LAYA_CHECKPOINTS', 'LAYA_ONNX_ROOT'].each { name ->
+        def value = System.getenv(name)
+        inputs.property("env.$name", value ?: '')
+        if (value) {
+            environment name, value
+        }
+    }
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.compilerArgs << '-parameters'
+}
+
+springBoot {
+    mainClass = 'koboolean.layarouter.LayaRouterApplication'
+}
