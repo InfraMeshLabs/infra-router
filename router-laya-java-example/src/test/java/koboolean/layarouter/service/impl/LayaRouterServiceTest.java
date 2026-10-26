@@ -7,8 +7,8 @@ import com.inframesh.node.dto.router.RoutingRequest;
 import com.inframesh.node.dto.router.WorkerCandidate;
 import com.inframesh.node.enums.ChatRole;
 import com.inframesh.node.enums.ExecutionLocation;
-import koboolean.layarouter.config.LayaRouterProperties;
 import koboolean.layarouter.config.LayaRouterProperties.ModelCapabilityRule;
+import koboolean.layarouter.config.LayaRouterProperties;
 import koboolean.layarouter.laya.LayaTierClassifier;
 import koboolean.layarouter.laya.TierDecision;
 import koboolean.layarouter.laya.WorkerTier;
@@ -19,9 +19,11 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.core.io.ByteArrayResource;
 import org.springframework.http.HttpStatus;
 import org.springframework.web.server.ResponseStatusException;
 
+import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Map;
 
@@ -35,6 +37,9 @@ import static org.mockito.Mockito.when;
 @ExtendWith(MockitoExtension.class)
 class LayaRouterServiceTest {
 
+    // The real template is free text; these tests pin Laya's input to the message alone.
+    private static final ByteArrayResource MESSAGE_ONLY = new ByteArrayResource("{message}".getBytes(StandardCharsets.UTF_8));
+
     @Mock
     private LayaTierClassifier classifier;
 
@@ -47,7 +52,7 @@ class LayaRouterServiceTest {
         properties.setModelCapabilities(List.of(
                 new ModelCapabilityRule("gemma3:4b", WorkerTier.SMALL),
                 new ModelCapabilityRule("qwen3:8b", WorkerTier.MEDIUM)));
-        service = new LayaRouterServiceImpl(classifier, new PromptBuilder(), new WorkerSelector(properties));
+        service = new LayaRouterServiceImpl(classifier, new PromptBuilder(MESSAGE_ONLY), new WorkerSelector(properties), properties);
     }
 
     @Test
@@ -84,6 +89,17 @@ class LayaRouterServiceTest {
     }
 
     @Test
+    void usesAnExternalWorkerOnlyWhenItIsClearlyLessLoaded() {
+        when(classifier.classify("hello")).thenReturn(new TierDecision(WorkerTier.MEDIUM, Map.of()));
+
+        long workerId = service.route(request(List.of(ChatMessage.user("hello")), null, List.of(
+                worker(1, "qwen3:8b", ExecutionLocation.LOCAL, 10),
+                worker(2, "qwen3:8b", ExecutionLocation.EXTERNAL, 0)))).workerId();
+
+        assertThat(workerId).isEqualTo(2L);
+    }
+
+    @Test
     void propagatesALayaFailureAsBadGateway() {
         when(classifier.classify(any())).thenThrow(new ResponseStatusException(HttpStatus.BAD_GATEWAY, "boom"));
 
@@ -102,7 +118,7 @@ class LayaRouterServiceTest {
                 ChatMessage.user("  second question  "),
                 new ChatMessage(ChatRole.ASSISTANT, null)), null, List.of());
 
-        assertThat(new PromptBuilder().build(request)).contains("second question");
+        assertThat(new PromptBuilder(MESSAGE_ONLY).build(request, List.of())).contains("second question");
     }
 
     @Test
@@ -111,13 +127,25 @@ class LayaRouterServiceTest {
                 ChatMessage.user(" "),
                 ChatMessage.toolResult("call-1", "tool output")), null, List.of());
 
-        assertThat(new PromptBuilder().build(request)).contains("tool output");
+        assertThat(new PromptBuilder(MESSAGE_ONLY).build(request, List.of())).contains("tool output");
     }
 
     @Test
     void promptIsEmptyWhenThereIsNoMessageContent() {
-        assertThat(new PromptBuilder().build(request(List.of(), null, List.of()))).isEmpty();
-        assertThat(new PromptBuilder().build(request(null, null, List.of()))).isEmpty();
+        assertThat(new PromptBuilder(MESSAGE_ONLY).build(request(List.of(), null, List.of()), List.of())).isEmpty();
+        assertThat(new PromptBuilder(MESSAGE_ONLY).build(request(null, null, List.of()), List.of())).isEmpty();
+    }
+
+    @Test
+    void promptFillsTheSameVariablesAsTheSpringAiRouter() {
+        PromptBuilder builder = new PromptBuilder(new ByteArrayResource(
+                "{messages}|{message}|{preferredModel}|{requiredProvider}|{candidates}".getBytes(StandardCharsets.UTF_8)));
+        RoutingRequest request = request(List.of(ChatMessage.system("be brief"), ChatMessage.user("hello")),
+                null, List.of());
+
+        String prompt = builder.build(request, List.of(worker(7, "qwen3:8b"))).orElseThrow();
+
+        assertThat(prompt).startsWith("- [SYSTEM] be brief\n- [USER] hello|hello|none|none|- workerId=7, name=");
     }
 
     private static RoutingRequest request(List<ChatMessage> messages, RoutingHints hints, List<WorkerCandidate> workers) {
@@ -125,9 +153,13 @@ class LayaRouterServiceTest {
     }
 
     private static WorkerCandidate worker(long workerId, String model) {
+        return worker(workerId, model, ExecutionLocation.LOCAL, 0);
+    }
+
+    private static WorkerCandidate worker(long workerId, String model, ExecutionLocation location, int requestCount) {
         return new WorkerCandidate(workerId, "worker-" + workerId, null,
-                List.of(new ModelInfo("OLLAMA", model, ExecutionLocation.LOCAL)), "OLLAMA", null, null,
-                0, 0, null, null, null, null, null, null, null, null, null, null, null);
+                List.of(new ModelInfo("OLLAMA", model, location)), "OLLAMA", null, null,
+                requestCount, 0, null, null, null, null, null, null, null, null, null, null, null);
     }
 
     private static void assertStatus(Runnable call, int status) {

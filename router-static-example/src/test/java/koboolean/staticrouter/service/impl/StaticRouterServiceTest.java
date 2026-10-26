@@ -7,7 +7,9 @@ import com.inframesh.node.dto.router.RoutingRequest;
 import com.inframesh.node.dto.router.RoutingResponse;
 import com.inframesh.node.dto.router.WorkerCandidate;
 import com.inframesh.node.enums.ExecutionLocation;
+import koboolean.staticrouter.config.StaticRouterProperties;
 import koboolean.staticrouter.config.StaticRouterWeights;
+import koboolean.staticrouter.error.RoutingRejectedException;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.web.server.ResponseStatusException;
@@ -30,7 +32,7 @@ class StaticRouterServiceTest {
         weights.setLatency(0.20);
         weights.setGpuUsage(0.15);
         weights.setVramUsage(0.10);
-        service = new StaticRouterServiceImpl(weights);
+        service = new StaticRouterServiceImpl(weights, new StaticRouterProperties());
     }
 
     @Test
@@ -84,6 +86,69 @@ class StaticRouterServiceTest {
         RoutingResponse response = service.route(routingRequest(null, List.of(cpuOnly, healthyGpu)));
 
         assertThat(response.workerId()).isEqualTo(2L);
+    }
+
+    @Test
+    void doesNotAssumeAWorkerThatReportsNoMetricsIsIdle() {
+        WorkerCandidate unknown = new WorkerCandidate(1L, "worker-1", null, List.of(local("OLLAMA", "qwen3")), "OLLAMA",
+                null, null, null, null, null, null, null, null, null, null, null, null, null, null, null);
+        WorkerCandidate busy = candidate(2L, 6, 3, 1500, 80, 80);
+
+        RoutingResponse response = service.route(routingRequest(null, List.of(unknown, busy)));
+
+        assertThat(response.workerId()).isEqualTo(2L);
+    }
+
+    @Test
+    void scoresACpuOnlyWorkerOnItsCpuAndMemoryUsage() {
+        WorkerCandidate saturatedCpu = cpuOnly(1L, 2, 95, 90);
+        WorkerCandidate idleCpu = cpuOnly(2L, 2, 10, 30);
+
+        RoutingResponse response = service.route(routingRequest(null, List.of(saturatedCpu, idleCpu)));
+
+        assertThat(response.workerId()).isEqualTo(2L);
+    }
+
+    @Test
+    void usesSystemMemoryForAGpuWithUnifiedMemory() {
+        // Apple Silicon reports GPU usage but no VRAM: its memory is the system memory.
+        WorkerCandidate memoryBound = unifiedMemory(1L, 40, 95);
+        WorkerCandidate memoryFree = unifiedMemory(2L, 40, 20);
+
+        RoutingResponse response = service.route(routingRequest(null, List.of(memoryBound, memoryFree)));
+
+        assertThat(response.workerId()).isEqualTo(2L);
+    }
+
+    @Test
+    void prefersALocalWorkerOverASlightlyLessLoadedExternalOne() {
+        // Load scores 0.30 vs 0.225: the external Worker is less loaded, but not by the 0.1 penalty.
+        WorkerCandidate local = withLoad(candidateWithModel(1L, local("OLLAMA", "qwen3")), 4);
+        WorkerCandidate external = withLoad(candidateWithModel(2L, external("OPENAI", "gpt-4o")), 3);
+
+        RoutingResponse response = service.route(routingRequest(null, List.of(local, external)));
+
+        assertThat(response.workerId()).isEqualTo(1L);
+    }
+
+    @Test
+    void stillUsesAnExternalWorkerThatIsClearlyLessLoaded() {
+        WorkerCandidate local = withLoad(candidateWithModel(1L, local("OLLAMA", "qwen3")), 10);
+        WorkerCandidate external = withLoad(candidateWithModel(2L, external("OPENAI", "gpt-4o")), 0);
+
+        RoutingResponse response = service.route(routingRequest(null, List.of(local, external)));
+
+        assertThat(response.workerId()).isEqualTo(2L);
+    }
+
+    @Test
+    void treatsAnUnknownExecutionLocationLikeAnExternalOne() {
+        WorkerCandidate local = withLoad(candidateWithModel(1L, local("OLLAMA", "qwen3")), 4);
+        WorkerCandidate unknown = withLoad(candidateWithModel(2L, new ModelInfo("OLLAMA", "qwen3", null)), 3);
+
+        RoutingResponse response = service.route(routingRequest(null, List.of(local, unknown)));
+
+        assertThat(response.workerId()).isEqualTo(1L);
     }
 
     @Test
@@ -168,8 +233,11 @@ class StaticRouterServiceTest {
         RoutingRequest request = routingRequest(privateData(), List.of(externalOnly));
 
         assertThatThrownBy(() -> service.route(request))
-                .isInstanceOfSatisfying(ResponseStatusException.class,
-                        e -> assertThat(e.getStatusCode().value()).isEqualTo(422));
+                .isInstanceOfSatisfying(RoutingRejectedException.class, e -> {
+                    assertThat(e.getStatusCode().value()).isEqualTo(422);
+                    assertThat(e.getCode()).isEqualTo("PRIVATE_DATA_NO_LOCAL_WORKER");
+                    assertThat(e.nodeError().code()).isEqualTo("PRIVATE_DATA_NO_LOCAL_WORKER");
+                });
     }
 
     @Test
@@ -220,6 +288,27 @@ class StaticRouterServiceTest {
                 null, null);
     }
 
+    // As Console sends it today: no queueSize / averageLatency / throughput / errorCount.
+    private WorkerCandidate cpuOnly(Long workerId, int requestCount, int cpuUsagePercent, int memoryUsagePercent) {
+        return new WorkerCandidate(workerId, "worker-" + workerId, null, List.of(local("OLLAMA", "qwen3")), "OLLAMA",
+                "OLLAMA", "0.6.0",
+                requestCount, null, null, null, null,
+                "cpu", BigDecimal.valueOf(cpuUsagePercent),
+                "memory", BigDecimal.valueOf(memoryUsagePercent),
+                null, null,
+                null, null);
+    }
+
+    private WorkerCandidate unifiedMemory(Long workerId, int gpuUsagePercent, int memoryUsagePercent) {
+        return new WorkerCandidate(workerId, "worker-" + workerId, null, List.of(local("OLLAMA", "qwen3")), "OLLAMA",
+                "OLLAMA", "0.6.0",
+                1, null, null, null, null,
+                "Apple M3 Max", BigDecimal.valueOf(5),
+                "64 GB", BigDecimal.valueOf(memoryUsagePercent),
+                "Apple M3 Max", BigDecimal.valueOf(gpuUsagePercent),
+                null, null);
+    }
+
     private WorkerCandidate candidateWithModel(Long workerId, ModelInfo model) {
         return new WorkerCandidate(workerId, "worker-" + workerId, null, List.of(model), "OLLAMA",
                 "SPRING_AI", "1.0.0",
@@ -228,6 +317,13 @@ class StaticRouterServiceTest {
                 "memory", BigDecimal.ZERO,
                 "gpu", BigDecimal.ZERO,
                 "vram", BigDecimal.ZERO);
+    }
+
+    private WorkerCandidate withLoad(WorkerCandidate c, int requestCount) {
+        return new WorkerCandidate(c.workerId(), c.name(), c.description(), c.models(), c.provider(),
+                c.framework(), c.frameworkVersion(), requestCount, c.queueSize(), c.averageLatency(), c.throughput(),
+                c.errorCount(), c.cpu(), c.cpuUsage(), c.memory(), c.memoryUsage(), c.gpu(), c.gpuUsage(), c.vram(),
+                c.vramUsage());
     }
 
     private RoutingRequest routingRequest(RoutingHints hints, List<WorkerCandidate> workers) {

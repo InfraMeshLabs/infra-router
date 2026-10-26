@@ -94,7 +94,7 @@ def create_app(settings: Optional[Settings] = None, laya_router: Optional[LayaRo
     @app.exception_handler(RoutingError)
     async def routing_error_handler(request: Request, error: RoutingError):
         log.warning("Routing failed (%s): %s", error.status, error.message)
-        return _error_response(request, error.status, error.message)
+        return _error_response(request, error.status, error.message, error.code)
 
     @app.exception_handler(RequestValidationError)
     async def validation_error_handler(request: Request, _: RequestValidationError):
@@ -130,8 +130,10 @@ def create_app(settings: Optional[Settings] = None, laya_router: Optional[LayaRo
         decision = laya.classify(prompt)
         laya_ms = _elapsed_ms(laya_started)
 
+        required_tier = decision.required_tier(settings.confidence_threshold)
+
         selection_started = time.perf_counter()
-        selected = worker_selector.select(decision.tier, eligible)
+        selected = worker_selector.select(required_tier, eligible)
         selection_ms += _elapsed_ms(selection_started)
 
         # The user's prompt is never logged.
@@ -139,6 +141,7 @@ def create_app(settings: Optional[Settings] = None, laya_router: Optional[LayaRo
             "event": "routing_decision",
             "sessionId": request.session_id,
             "layaTier": decision.tier.value,
+            "requiredTier": required_tier.value,
             "candidateWorkerCount": len(request.workers or []),
             "selectedWorkerId": selected.worker_id,
             "layaLatencyMs": round(laya_ms, 2),
@@ -159,18 +162,19 @@ def _elapsed_ms(started: float) -> float:
     return (time.perf_counter() - started) * 1000.0
 
 
-def _error_response(request: Request, status: int, message: str) -> JSONResponse:
-    # Same shape as the Spring Boot error body the Java Router examples return.
-    return JSONResponse(
-        status_code=int(status),
-        content={
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "status": int(status),
-            "error": HTTPStatus(status).phrase,
-            "message": message,
-            "path": request.url.path,
-        },
-    )
+def _error_response(request: Request, status: int, message: str, code: Optional[str] = None) -> JSONResponse:
+    # Same shape as the Spring Boot error body the Java Router examples return, with "code" for
+    # a refusal Console must tell apart (e.g. PRIVATE_DATA_NO_LOCAL_WORKER).
+    content = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "status": int(status),
+        "error": HTTPStatus(status).phrase,
+    }
+    if code is not None:
+        content["code"] = code
+    content["message"] = message
+    content["path"] = request.url.path
+    return JSONResponse(status_code=int(status), content=content)
 
 
 # --- Node health collection (NodeHealthResponse.system) ---------------------------------

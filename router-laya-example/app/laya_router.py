@@ -30,10 +30,26 @@ QUESTIONS = {
 
 @dataclass(frozen=True)
 class TierDecision:
+    # The tier Laya chose - the most probable one.
     tier: WorkerTier
-    # Debug/logging only. Confidence is deliberately not carried: the current checkpoint
-    # ships uncalibrated temperatures, so routing decisions use ``choice`` alone.
+    # Laya's probability per tier label. The checkpoint ships uncalibrated temperatures, so
+    # these rank the tiers but are not true likelihoods; tune router.laya.confidence-threshold
+    # against real traffic.
     probabilities: Optional[dict[str, float]] = None
+
+    def required_tier(self, confidence_threshold: Optional[float]) -> WorkerTier:
+        """The tier to route to. Without a threshold, Laya's choice. With one, the lowest
+        tier whose cumulative probability - it and every tier below it - reaches the
+        threshold, but never below Laya's choice: an ambiguous answer escalates, never down."""
+        if confidence_threshold is None or not self.probabilities:
+            return self.tier
+        cumulative = 0.0
+        for candidate in WorkerTier:
+            cumulative += self.probabilities.get(candidate.value, 0.0)
+            if cumulative >= confidence_threshold:
+                return candidate if candidate.rank >= self.tier.rank else self.tier
+        # Rounding left the total just under the threshold: only the most capable tier is safe.
+        return max(WorkerTier, key=lambda t: t.rank)
 
 
 def _create_laya_engine() -> Any:

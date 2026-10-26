@@ -63,12 +63,23 @@ class Settings:
     security_enabled: bool = True
     api_key: Optional[str] = None
     fallback_policy: FallbackPolicy = FallbackPolicy.FALLBACK
+    # None: route to the tier Laya finds most probable. (0, 1]: route to the lowest tier whose
+    # cumulative probability reaches it, escalating ambiguous answers (TierDecision.required_tier).
+    confidence_threshold: Optional[float] = None
+    # Added to the Load Score of a Worker that is not LOCAL-only - same as router-static-example.
+    external_penalty: float = 0.1
     # Tier of a model that matches no rule, and of a Worker that reports no models.
     default_tier: WorkerTier = WorkerTier.SMALL
     weights: ScoreWeights = field(default_factory=ScoreWeights)
     model_capabilities: tuple[ModelCapabilityRule, ...] = ()
 
     def __post_init__(self) -> None:
+        if self.confidence_threshold is not None and not 0.0 < self.confidence_threshold <= 1.0:
+            raise ValueError(
+                f"router.laya.confidence-threshold must be in (0, 1] but was {self.confidence_threshold}."
+            )
+        if not 0.0 <= self.external_penalty <= 1.0:
+            raise ValueError(f"router.laya.external-penalty must be in [0, 1] but was {self.external_penalty}.")
         if not self.security_enabled:
             return
         if not (self.api_key and self.api_key.strip()):
@@ -103,12 +114,16 @@ class Settings:
             "security.enabled", os.environ.get("SECURITY_ENABLED") or security.get("enabled", True)
         )
 
+        threshold = os.environ.get("ROUTER_LAYA_CONFIDENCE_THRESHOLD") or laya.get("confidence-threshold")
+
         return Settings(
             security_enabled=security_enabled,
             api_key=os.environ.get("INFRA_NODE_API_KEY") or None,
             fallback_policy=FallbackPolicy(
                 str(os.environ.get("ROUTER_LAYA_FALLBACK_POLICY") or laya.get("fallback-policy", "FALLBACK")).upper()
             ),
+            confidence_threshold=float(threshold) if threshold is not None else None,
+            external_penalty=float(laya.get("external-penalty", 0.1)),
             default_tier=WorkerTier(str(laya.get("default-tier", "small")).lower()),
             weights=ScoreWeights(
                 request_count=float(weights.get("request-count", 0.30)),

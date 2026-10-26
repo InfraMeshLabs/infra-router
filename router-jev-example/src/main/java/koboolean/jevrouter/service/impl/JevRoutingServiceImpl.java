@@ -10,6 +10,7 @@ import koboolean.jevrouter.client.JevClient;
 import koboolean.jevrouter.client.JevClientException;
 import koboolean.jevrouter.dto.JevChoiceResponse.ChoiceAnswer;
 import koboolean.jevrouter.dto.JevWorkerState;
+import koboolean.jevrouter.error.RoutingRejectedException;
 import koboolean.jevrouter.service.RouterService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -41,15 +42,19 @@ import java.util.Optional;
  * <p>
  * Jev is asked a single Choice question - "which of these eligible Workers fits this
  * request best" - with one option per remaining candidate (keyed {@code worker_<id>}) and
- * their {@code currentRequestCount}/{@code queueSize}/{@code averageLatency}/
- * {@code gpuUsage}/{@code vramUsage} as state. The returned choice is trusted only if it
+ * their {@code executionLocation}/{@code currentRequestCount}/{@code queueSize}/
+ * {@code averageLatency}/{@code gpuUsage}/{@code vramUsage} as state. {@code executionLocation}
+ * summarizes the Worker's models - LOCAL, EXTERNAL, MIXED or UNKNOWN - and the instructions ask
+ * Jev to prefer LOCAL Workers. Jev never sees the request messages: it is an external API, so
+ * asking it whether the content may leave the organization would already have sent the content
+ * out. Sensitive content is guarded only by the {@code privateData} hard filter here. The returned choice is trusted only if it
  * names a candidate that was actually offered; an unknown choice is treated exactly like a
  * failed call.
  * <p>
  * Jev is an external HTTP call and can time out, be rate-limited, or fail outright. Rather
  * than let a routing decision hang indefinitely or fail the whole request over a transient
  * API problem, any {@link JevClientException} (or an unrecognized worker choice) falls
- * back to a small deterministic ordering - lowest {@code queueSize}, then lowest
+ * back to a small deterministic ordering - LOCAL-only Workers first, then lowest {@code queueSize}, then lowest
  * {@code currentRequestCount}, then lowest {@code averageLatency}, then lowest
  * {@code workerId} - logged loudly rather than silently. This is intentionally not the
  * full weighted/configurable algorithm in {@code router-static-example}: duplicating that
@@ -64,8 +69,11 @@ public class JevRoutingServiceImpl implements RouterService {
     private static final HttpStatus UNPROCESSABLE_ENTITY = HttpStatus.valueOf(422);
     private static final String WORKER_OPTION_PREFIX = "worker_";
 
+    private static final String LOCAL = "LOCAL";
+
     private static final Comparator<WorkerCandidate> FALLBACK_ORDER = Comparator
-            .comparing((WorkerCandidate c) -> c.queueSize() == null ? Integer.MAX_VALUE : c.queueSize())
+            .comparing((WorkerCandidate c) -> !LOCAL.equals(executionLocation(c)))
+            .thenComparing(c -> c.queueSize() == null ? Integer.MAX_VALUE : c.queueSize())
             .thenComparing(c -> c.currentRequestCount() == null ? Integer.MAX_VALUE : c.currentRequestCount())
             .thenComparing(c -> c.averageLatency() == null ? BigDecimal.valueOf(Long.MAX_VALUE) : c.averageLatency())
             .thenComparing(WorkerCandidate::workerId);
@@ -153,7 +161,7 @@ public class JevRoutingServiceImpl implements RouterService {
                 .toList();
 
         if (matched.isEmpty()) {
-            throw new ResponseStatusException(UNPROCESSABLE_ENTITY,
+            throw new RoutingRejectedException(RoutingRejectedException.PRIVATE_DATA_NO_LOCAL_WORKER,
                     "privateData routing hint is set but no worker candidate is LOCAL-only.");
         }
 
@@ -215,7 +223,7 @@ public class JevRoutingServiceImpl implements RouterService {
     private List<JevWorkerState> toState(List<WorkerCandidate> eligible) {
         return eligible.stream()
                 .map(c -> new JevWorkerState(c.workerId(), c.name(), modelNames(c), c.provider(),
-                        c.currentRequestCount(), c.queueSize(), c.averageLatency(), c.gpuUsage(), c.vramUsage()))
+                        executionLocation(c), c.currentRequestCount(), c.queueSize(), c.averageLatency(), c.gpuUsage(), c.vramUsage()))
                 .toList();
     }
 
@@ -231,11 +239,24 @@ public class JevRoutingServiceImpl implements RouterService {
         return "name=" + candidate.name()
                 + ", provider=" + candidate.provider()
                 + ", models=" + modelNames(candidate)
+                + ", executionLocation=" + executionLocation(candidate)
                 + ", currentRequestCount=" + candidate.currentRequestCount()
                 + ", queueSize=" + candidate.queueSize()
                 + ", averageLatency=" + candidate.averageLatency()
                 + ", gpuUsage=" + candidate.gpuUsage()
                 + ", vramUsage=" + candidate.vramUsage();
+    }
+
+    // LOCAL / EXTERNAL when every model runs there, MIXED when both occur, and UNKNOWN for no
+    // models or a model with no reported location - which, as for privateData, is never LOCAL.
+    private static String executionLocation(WorkerCandidate candidate) {
+        List<ModelInfo> models = candidate.models();
+        if (models == null || models.isEmpty() || models.stream().anyMatch(m -> m.executionLocation() == null)) {
+            return "UNKNOWN";
+        }
+        boolean local = models.stream().anyMatch(m -> m.executionLocation() == ExecutionLocation.LOCAL);
+        boolean external = models.stream().anyMatch(m -> m.executionLocation() == ExecutionLocation.EXTERNAL);
+        return local && external ? "MIXED" : local ? LOCAL : "EXTERNAL";
     }
 
     private List<String> modelNames(WorkerCandidate candidate) {

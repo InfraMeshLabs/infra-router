@@ -4,10 +4,11 @@ import com.inframesh.node.dto.router.ModelInfo;
 import com.inframesh.node.dto.router.RoutingHints;
 import com.inframesh.node.dto.router.WorkerCandidate;
 import com.inframesh.node.enums.ExecutionLocation;
-import koboolean.layarouter.config.LayaRouterProperties;
 import koboolean.layarouter.config.LayaRouterProperties.FallbackPolicy;
 import koboolean.layarouter.config.LayaRouterProperties.ModelCapabilityRule;
 import koboolean.layarouter.config.LayaRouterProperties.Weights;
+import koboolean.layarouter.config.LayaRouterProperties;
+import koboolean.layarouter.error.RoutingRejectedException;
 import koboolean.layarouter.laya.WorkerTier;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -38,8 +39,8 @@ import java.util.regex.Pattern;
  * For the tier Laya asked for, the Workers of the closest tier that is at least as capable are
  * used (a SMALL request does not occupy a POWERFUL Worker while a SMALL one exists). When no
  * Worker is capable enough the {@link FallbackPolicy} decides. Within the chosen tier the Worker
- * with the lowest Load Score wins - the same normalization, missing-metric handling and tie-break
- * as router-static-example's {@code StaticRouterServiceImpl}.
+ * with the lowest Load Score wins - the same normalization, missing-metric handling, external
+ * penalty and tie-break as router-static-example's {@code StaticRouterServiceImpl}.
  */
 @Component
 public class WorkerSelector {
@@ -48,17 +49,21 @@ public class WorkerSelector {
 
     private static final HttpStatus UNPROCESSABLE_ENTITY = HttpStatus.valueOf(422);
     private static final BigDecimal USAGE_PERCENTAGE_SCALE = BigDecimal.valueOf(100);
+    /** Score of a Worker that reports no metric at all - treated as fully loaded. */
+    private static final double UNKNOWN_LOAD_SCORE = 1.0;
 
     private final List<CompiledRule> rules;
     private final WorkerTier defaultTier;
     private final Weights weights;
     private final FallbackPolicy fallbackPolicy;
+    private final double externalPenalty;
 
     public WorkerSelector(LayaRouterProperties properties) {
         this.rules = properties.getModelCapabilities().stream().map(CompiledRule::of).toList();
         this.defaultTier = properties.getDefaultTier();
         this.weights = properties.getWeights();
         this.fallbackPolicy = properties.getFallbackPolicy();
+        this.externalPenalty = properties.getExternalPenalty();
     }
 
     // --- RoutingHints filtering (mirrors the other Router examples' hard-constraint policy) --
@@ -97,7 +102,7 @@ public class WorkerSelector {
         if (hints.isPrivateData()) {
             eligible = eligible.stream().filter(this::isSafeForPrivateData).toList();
             if (eligible.isEmpty()) {
-                throw new ResponseStatusException(UNPROCESSABLE_ENTITY,
+                throw new RoutingRejectedException(RoutingRejectedException.PRIVATE_DATA_NO_LOCAL_WORKER,
                         "privateData routing hint is set but no worker candidate is LOCAL-only.");
             }
         }
@@ -188,8 +193,8 @@ public class WorkerSelector {
                 ratio(toBigDecimal(candidate.currentRequestCount()), maxRequestCount),
                 ratio(toBigDecimal(candidate.queueSize()), maxQueueSize),
                 ratio(candidate.averageLatency(), maxLatency),
-                percentage(candidate.gpuUsage()),
-                percentage(candidate.vramUsage()),
+                percentage(computeUsage(candidate)),
+                percentage(memoryUsage(candidate)),
         };
         double[] metricWeights = {
                 weights.getRequestCount(), weights.getQueueSize(), weights.getLatency(),
@@ -197,8 +202,8 @@ public class WorkerSelector {
         };
 
         // A missing metric is excluded, not defaulted to 0, and its weight is redistributed over
-        // the metrics the Worker does report - otherwise a CPU-only Worker would look better than
-        // a GPU Worker reporting low usage.
+        // the metrics the Worker does report - otherwise a Worker would look idle just because it
+        // reports less. A Worker reporting nothing at all is scored as fully loaded.
         double weightedSum = 0.0;
         double availableWeight = 0.0;
         for (int i = 0; i < values.length; i++) {
@@ -207,7 +212,25 @@ public class WorkerSelector {
                 availableWeight += metricWeights[i];
             }
         }
-        return availableWeight > 0 ? weightedSum / availableWeight : 0.0;
+        double loadScore = availableWeight > 0 ? weightedSum / availableWeight : UNKNOWN_LOAD_SCORE;
+        // A Worker that may send the request data to an external AI provider wins only when it is
+        // clearly less loaded - same rule as router-static-example's external-penalty.
+        return isSafeForPrivateData(candidate) ? loadScore : loadScore + externalPenalty;
+    }
+
+    // Usage of whatever the Worker runs inference on - same rule as router-static-example: its GPU
+    // and VRAM, or CPU and system memory on a CPU-only Worker (system memory also for a GPU with
+    // unified memory, which reports no VRAM).
+    private BigDecimal computeUsage(WorkerCandidate candidate) {
+        return hasGpu(candidate) ? candidate.gpuUsage() : candidate.cpuUsage();
+    }
+
+    private BigDecimal memoryUsage(WorkerCandidate candidate) {
+        return hasGpu(candidate) && candidate.vramUsage() != null ? candidate.vramUsage() : candidate.memoryUsage();
+    }
+
+    private boolean hasGpu(WorkerCandidate candidate) {
+        return candidate.gpu() != null && !candidate.gpu().isBlank();
     }
 
     private Double ratio(BigDecimal value, BigDecimal max) {

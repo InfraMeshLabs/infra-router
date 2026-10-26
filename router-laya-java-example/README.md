@@ -35,10 +35,24 @@ router-laya-java-example  (Spring Boot, port 8094)
 | Console / Worker | Everything else. |
 
 Laya is asked one Choice question — *"Which worker class is most appropriate for this
-request?"* — with `small` / `medium` / `powerful` as options. Only `choice` is used;
-confidence is not (the checkpoints ship uncalibrated temperatures), and `probabilities` are
-logged at `DEBUG` only. A Laya failure is reported as `502` — Laya is local, so there is no
-transient remote failure to fall back from.
+request?"* — with `small` / `medium` / `powerful` as options. By default the Router routes to
+`choice`, the most probable tier. With `confidence-threshold` set, it uses the `probabilities`
+to escalate an ambiguous answer: it routes to the lowest tier whose cumulative probability (that
+tier plus every tier below it) reaches the threshold, never below `choice`. With `0.8`,
+`0.05 / 0.90 / 0.05` stays `medium`, while `0.30 / 0.36 / 0.34` goes to `powerful`. The
+checkpoints ship uncalibrated temperatures, so these probabilities rank the tiers but are not
+true likelihoods: tune the threshold against real traffic. `confidence` itself is not used, and
+`probabilities` are logged at `DEBUG` only.
+
+Laya does **not** judge whether the request content is sensitive. That was tried and removed:
+Laya classifies what a text is *about*, not whether it holds an actual secret value, so it
+flagged ordinary questions that merely mention passwords and missed a message carrying a real
+national ID and phone number. Sensitive data is kept off external providers by the
+`privateData` hint (a hard filter, `422 PRIVATE_DATA_NO_LOCAL_WORKER` when no LOCAL-only Worker
+is left) - see "Sensitive data detection" in the root README for the measurements. Among the
+eligible Workers, one that is not LOCAL-only gets `external-penalty` (default `0.1`) added to
+its Load Score, as in `router-static-example`. A Laya failure is reported as `502` — Laya is local, so
+there is no transient remote failure to fall back from.
 
 laya-java's `Router` picks the checkpoint per request, as the Python `laya.Router` does:
 `english` for English text, `multilingual` for everything else. Both are loaded at startup
@@ -77,9 +91,13 @@ is `layaJavaVersion` in the root `gradle.properties`.
 
 laya-java does not download anything: it reads a checkpoint directory and an exported ONNX
 graph. Prepare both checkpoints once, with laya's own script, in a virtualenv that is not
-this repository's:
+this repository's. The script lives in the laya clone from [Building laya-java](#building-laya-java);
+if laya-java is already in `~/.m2` and you skipped that step, clone laya first:
 
 ```bash
+# Skip if ~/src/laya is already a laya clone (see Building laya-java).
+git clone https://github.com/NandhaKishorM/laya.git ~/src/laya
+
 cd ~/src/laya
 python3 -m venv .venv-export
 .venv-export/bin/pip install 'laya[onnx]==0.4.13'
@@ -91,7 +109,12 @@ done
 
 This writes `laya-java/.work/checkpoints/{english,multilingual}` and
 `laya-java/.work/onnx/{english,multilingual}/laya.onnx` (+ `laya.onnx.data`), and verifies
-each graph against PyTorch. Keep them outside this repository.
+each graph against PyTorch. Keep them outside this repository. Check that both exist before
+starting the Router:
+
+```bash
+ls ~/src/laya/laya-java/.work/checkpoints ~/src/laya/laya-java/.work/onnx   # english  multilingual
+```
 
 ## Local Run
 
@@ -101,6 +124,10 @@ export LAYA_ONNX_ROOT=~/src/laya/laya-java/.work/onnx
 
 INFRA_NODE_API_KEY=<node api key> ./gradlew :router-laya-java-example:bootRun
 ```
+
+Only an unquoted shell `export` expands `~`. In an IDE run configuration or a `.env` file, give
+absolute paths (`/Users/<you>/src/laya/...`): a literal `~` is resolved against the working
+directory and startup fails with `is not a directory`.
 
 It listens on port `8094`. Startup loads both checkpoints and runs a warm-up predict before
 the Router accepts requests (about 3s on an M3 Max; a routing decision then takes ~75ms of
@@ -121,6 +148,8 @@ example's `application.yml`, plus where the model lives:
 | `onnx-root` | `${LAYA_ONNX_ROOT}` | Holds `english/laya.onnx` and `multilingual/laya.onnx`. Required. |
 | `preload` | `[english, multilingual]` | Checkpoints loaded at startup. |
 | `max-loaded` | `2` | Checkpoints resident at once — a memory ceiling. |
+| `confidence-threshold` | unset | Unset: route to Laya's `choice`. `(0, 1]`: escalate ambiguous answers — see [Architecture](#architecture). |
+| `external-penalty` | `0.1` | Added to the Load Score of a Worker that is not LOCAL-only. |
 | `fallback-policy` | `FALLBACK` | `STRICT`: no capable Worker → 422. `FALLBACK`: use the highest available tier. Env: `ROUTER_LAYA_FALLBACK_POLICY`. |
 | `default-tier` | `small` | Tier of an unmapped model, and of a Worker with no models. |
 | `model-capabilities` | examples | `pattern` (case-insensitive, `*` / `?` wildcards) → `tier`; first match wins. |
@@ -128,6 +157,22 @@ example's `application.yml`, plus where the model lives:
 
 Authentication is infra-node's: `infra.node.api-key`, from `INFRA_NODE_API_KEY` (the
 committed default is a local development key only).
+
+### Prompts
+
+The text Laya is given lives in `src/main/resources/prompts/`, as in `router-spring-ai-example`:
+
+| File | Content |
+|---|---|
+| `routing-system-prompt.st` | The question Laya answers, read as is. |
+| `routing-user-prompt.st` | The text Laya classifies. The default is `{message}`, the last user message. |
+
+The user prompt accepts the same variables as `router-spring-ai-example` — `{messages}`,
+`{preferredModel}`, `{requiredProvider}`, `{candidates}` (the Workers left after the hint
+filters) — but the default leaves them out on purpose. Laya only judges how hard the request is.
+Worker metrics are already used by `WorkerSelector`, and every extra token makes the predict
+call slower and can push the request text past the model's input limit. Laya's choice depends
+on this wording, so re-check the tiers it picks (`LayaModelIntegrationTest`) after changing it.
 
 ## Tests
 

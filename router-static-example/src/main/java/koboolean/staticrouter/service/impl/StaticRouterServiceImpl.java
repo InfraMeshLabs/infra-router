@@ -6,7 +6,9 @@ import com.inframesh.node.dto.router.RoutingRequest;
 import com.inframesh.node.dto.router.RoutingResponse;
 import com.inframesh.node.dto.router.WorkerCandidate;
 import com.inframesh.node.enums.ExecutionLocation;
+import koboolean.staticrouter.config.StaticRouterProperties;
 import koboolean.staticrouter.config.StaticRouterWeights;
+import koboolean.staticrouter.error.RoutingRejectedException;
 import koboolean.staticrouter.service.RouterService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -32,22 +34,36 @@ import java.util.function.Function;
  * candidate stays eligible.
  * <p>
  * The remaining candidates are scored with a Weighted Load Score built from five runtime
- * metrics: {@code currentRequestCount}, {@code queueSize}, {@code averageLatency},
- * {@code gpuUsage} and {@code vramUsage}. {@code currentRequestCount}, {@code queueSize}
- * and {@code averageLatency} have no known absolute maximum, so they are normalized
- * relative to the highest value among the eligible candidates. {@code gpuUsage} and
- * {@code vramUsage} are already reported as a 0-100 percentage (see
- * {@code com.inframesh.node.collector.NvidiaGpuHealthCollector}, which parses
- * {@code nvidia-smi}'s percentage output directly), so they are normalized by dividing by
- * 100. A lower score means a Worker has more spare capacity; the Worker with the minimum
- * score is selected.
+ * metrics: {@code currentRequestCount}, {@code queueSize}, {@code averageLatency}, compute
+ * usage and memory usage. {@code currentRequestCount}, {@code queueSize} and
+ * {@code averageLatency} have no known absolute maximum, so they are normalized relative to
+ * the highest value among the eligible candidates. Usage is reported by Console as a 0-100
+ * percentage, so it is normalized by dividing by 100. A lower score means a Worker has more
+ * spare capacity; the Worker with the minimum score is selected.
  * <p>
- * Any of the five metrics can be {@code null} for a given Worker (most commonly
- * {@code gpuUsage}/{@code vramUsage} on a CPU-only Worker). Rather than defaulting a
- * missing metric to 0 — which would make a Worker with no GPU look artificially better
- * than a Worker that actually reports low GPU usage — a missing metric is excluded from
- * that Worker's score and its configured weight is redistributed proportionally across
- * that Worker's remaining available metrics.
+ * Compute and memory usage measure whatever the Worker runs inference on: {@code gpuUsage}
+ * and {@code vramUsage} on a GPU Worker, {@code cpuUsage} and {@code memoryUsage} on a
+ * CPU-only Worker, and {@code memoryUsage} for a GPU with unified memory (Apple Silicon
+ * reports no VRAM). They are weighted by {@code router.static.weights.gpu-usage} and
+ * {@code vram-usage}.
+ * <p>
+ * Any metric can be {@code null} for a given Worker - Console does not populate
+ * {@code queueSize} or {@code averageLatency} yet. Rather than defaulting a missing metric to
+ * 0, which would make a Worker look idle because it reports less, a missing metric is
+ * excluded from that Worker's score and its weight is redistributed proportionally across
+ * that Worker's remaining metrics. A Worker that reports no metric at all is scored as fully
+ * loaded, as Console's own LEAST_BUSY strategy does: unknown load is never assumed to be idle.
+ * <p>
+ * Where a Worker runs its models ({@code ModelInfo.executionLocation}) is scored too. Without
+ * {@code privateData} an EXTERNAL Worker stays eligible, but a Worker that is not LOCAL-only -
+ * any EXTERNAL model, or a model or Worker whose location is unknown - has
+ * {@code router.static.external-penalty} added to its score: the request data may leave to an
+ * outside AI provider, so such a Worker wins only when it is clearly less loaded. With
+ * {@code privateData} it is not eligible at all.
+ * <p>
+ * {@code throughput} and {@code errorCount} are deliberately not scored: Console does not
+ * populate them yet, and {@code errorCount} is a lifetime total that would penalize a Worker
+ * for its age rather than its current health.
  */
 @Service
 public class StaticRouterServiceImpl implements RouterService {
@@ -56,11 +72,15 @@ public class StaticRouterServiceImpl implements RouterService {
 
     private static final HttpStatus UNPROCESSABLE_ENTITY = HttpStatus.valueOf(422);
     private static final BigDecimal USAGE_PERCENTAGE_SCALE = BigDecimal.valueOf(100);
+    /** Score of a Worker that reports no metric at all - treated as fully loaded. */
+    private static final double UNKNOWN_LOAD_SCORE = 1.0;
 
     private final StaticRouterWeights weights;
+    private final double externalPenalty;
 
-    public StaticRouterServiceImpl(StaticRouterWeights weights) {
+    public StaticRouterServiceImpl(StaticRouterWeights weights, StaticRouterProperties properties) {
         this.weights = weights;
+        this.externalPenalty = properties.getExternalPenalty();
     }
 
     @Override
@@ -127,7 +147,7 @@ public class StaticRouterServiceImpl implements RouterService {
                 .toList();
 
         if (matched.isEmpty()) {
-            throw new ResponseStatusException(UNPROCESSABLE_ENTITY,
+            throw new RoutingRejectedException(RoutingRejectedException.PRIVATE_DATA_NO_LOCAL_WORKER,
                     "privateData routing hint is set but no worker candidate is LOCAL-only.");
         }
 
@@ -181,9 +201,9 @@ public class StaticRouterServiceImpl implements RouterService {
         if (log.isDebugEnabled()) {
             log.debug("Routing candidates: {}", scored.size());
             scored.forEach(s -> log.debug(
-                    "worker={} request={} queue={} latency={} gpu={} vram={} score={}",
+                    "worker={} request={} queue={} latency={} compute={} memory={} localOnly={} score={}",
                     s.candidate.workerId(), s.normalizedRequestCount, s.normalizedQueueSize,
-                    s.normalizedLatency, s.normalizedGpuUsage, s.normalizedVramUsage, s.score));
+                    s.normalizedLatency, s.normalizedGpuUsage, s.normalizedVramUsage, s.localOnly, s.score));
         }
 
         WorkerCandidate selected = scored.get(0).candidate;
@@ -196,8 +216,8 @@ public class StaticRouterServiceImpl implements RouterService {
         Double normalizedRequestCount = ratio(toBigDecimal(candidate.currentRequestCount()), maxRequestCount);
         Double normalizedQueueSize = ratio(toBigDecimal(candidate.queueSize()), maxQueueSize);
         Double normalizedLatency = ratio(candidate.averageLatency(), maxLatency);
-        Double normalizedGpuUsage = percentage(candidate.gpuUsage());
-        Double normalizedVramUsage = percentage(candidate.vramUsage());
+        Double normalizedGpuUsage = percentage(computeUsage(candidate));
+        Double normalizedVramUsage = percentage(memoryUsage(candidate));
 
         double weightedSum = 0.0;
         double availableWeight = 0.0;
@@ -219,12 +239,28 @@ public class StaticRouterServiceImpl implements RouterService {
 
         // A missing metric is excluded rather than defaulted to 0, and the remaining
         // weight is renormalized to sum to 1 - see the class-level note. A candidate with
-        // no available metric at all falls back to a neutral score and is resolved by the
-        // tie-breaker instead.
-        double score = availableWeight > 0 ? weightedSum / availableWeight : 0.0;
+        // no available metric at all is scored as fully loaded.
+        double loadScore = availableWeight > 0 ? weightedSum / availableWeight : UNKNOWN_LOAD_SCORE;
+        boolean localOnly = isSafeForPrivateData(candidate);
+        double score = localOnly ? loadScore : loadScore + externalPenalty;
 
         return new ScoredCandidate(candidate, normalizedRequestCount, normalizedQueueSize,
-                normalizedLatency, normalizedGpuUsage, normalizedVramUsage, score);
+                normalizedLatency, normalizedGpuUsage, normalizedVramUsage, localOnly, score);
+    }
+
+    // The processor the Worker runs inference on: its GPU if it has one, otherwise its CPU.
+    private BigDecimal computeUsage(WorkerCandidate candidate) {
+        return hasGpu(candidate) ? candidate.gpuUsage() : candidate.cpuUsage();
+    }
+
+    // VRAM on a GPU Worker; system memory on a CPU-only Worker and on a GPU with unified
+    // memory, which reports no VRAM.
+    private BigDecimal memoryUsage(WorkerCandidate candidate) {
+        return hasGpu(candidate) && candidate.vramUsage() != null ? candidate.vramUsage() : candidate.memoryUsage();
+    }
+
+    private boolean hasGpu(WorkerCandidate candidate) {
+        return candidate.gpu() != null && !candidate.gpu().isBlank();
     }
 
     private double weighted(Double normalizedValue, double weight) {
@@ -274,6 +310,7 @@ public class StaticRouterServiceImpl implements RouterService {
             Double normalizedLatency,
             Double normalizedGpuUsage,
             Double normalizedVramUsage,
+            boolean localOnly,
             double score
     ) {
     }

@@ -117,6 +117,33 @@ def test_does_not_favor_a_cpu_worker_just_because_it_has_no_gpu_metrics():
     assert selector().select(WorkerTier.SMALL, [cpu_only, healthy_gpu]).worker_id == 2
 
 
+def test_does_not_assume_a_worker_that_reports_no_metrics_is_idle():
+    unknown = WorkerCandidate(worker_id=1, name="worker-1", provider="OLLAMA",
+                              models=[ModelInfo(provider="OLLAMA", model_name=SMALL_MODEL, execution_location="LOCAL")])
+    busy = candidate(2, request_count=6, queue_size=3, latency=1500, gpu_usage=80, vram_usage=80)
+
+    assert selector().select(WorkerTier.SMALL, [unknown, busy]).worker_id == 2
+
+
+def test_scores_a_cpu_only_worker_on_its_cpu_and_memory_usage():
+    def cpu_only(worker_id, cpu_usage, memory_usage):
+        worker = candidate(worker_id, request_count=2, queue_size=None, latency=None, gpu=None, gpu_usage=None,
+                           vram_usage=None)
+        return worker.model_copy(update={"cpu_usage": cpu_usage, "memory_usage": memory_usage})
+
+    assert selector().select(WorkerTier.SMALL, [cpu_only(1, 95, 90), cpu_only(2, 10, 30)]).worker_id == 2
+
+
+def test_prefers_a_local_worker_over_a_slightly_less_loaded_external_one():
+    # Request count is the only metric, so the load scores are 20/20 = 1.0 vs 19/20 = 0.95:
+    # the external Worker is less loaded, but not by the 0.1 penalty.
+    local = candidate(1, request_count=20, queue_size=None, latency=None, gpu=None, gpu_usage=None, vram_usage=None)
+    external = candidate(2, request_count=19, queue_size=None, latency=None, gpu=None, gpu_usage=None,
+                         vram_usage=None, location="EXTERNAL")
+
+    assert selector().select(WorkerTier.SMALL, [local, external]).worker_id == 1
+
+
 def test_breaks_identical_scores_deterministically_by_worker_id():
     a = candidate(5, request_count=4, queue_size=2, latency=1000, gpu_usage=50, vram_usage=50)
     b = candidate(2, request_count=4, queue_size=2, latency=1000, gpu_usage=50, vram_usage=50)
@@ -174,6 +201,7 @@ def test_rejects_when_private_data_leaves_no_eligible_worker():
         selector().filter_by_hints([candidate(1, location="EXTERNAL")], RoutingHints(private_data=True))
 
     assert error.value.status == 422
+    assert error.value.code == "PRIVATE_DATA_NO_LOCAL_WORKER"
 
 
 def test_preferred_model_is_a_soft_preference():

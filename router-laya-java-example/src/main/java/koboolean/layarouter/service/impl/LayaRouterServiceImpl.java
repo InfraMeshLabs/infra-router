@@ -3,8 +3,10 @@ package koboolean.layarouter.service.impl;
 import com.inframesh.node.dto.router.RoutingRequest;
 import com.inframesh.node.dto.router.RoutingResponse;
 import com.inframesh.node.dto.router.WorkerCandidate;
+import koboolean.layarouter.config.LayaRouterProperties;
 import koboolean.layarouter.laya.LayaTierClassifier;
 import koboolean.layarouter.laya.TierDecision;
+import koboolean.layarouter.laya.WorkerTier;
 import koboolean.layarouter.service.PromptBuilder;
 import koboolean.layarouter.service.RouterService;
 import koboolean.layarouter.service.WorkerSelector;
@@ -22,8 +24,9 @@ import java.util.List;
  * <ol>
  *     <li>RoutingHints hard filters / soft preference ({@link WorkerSelector}) - before Laya is
  *     called, so a request no Worker may serve never costs a forward pass;</li>
- *     <li>the last user message ({@link PromptBuilder}) is classified by Laya into a
- *     {@code WorkerTier} ({@link LayaTierClassifier});</li>
+ *     <li>the user prompt ({@link PromptBuilder}) is classified by Laya into a
+ *     {@code WorkerTier} ({@link LayaTierClassifier}), escalated when the answer is ambiguous
+ *     ({@link TierDecision#requiredTier(Double)});</li>
  *     <li>capability tier from configuration, then the lowest Load Score
  *     ({@link WorkerSelector}).</li>
  * </ol>
@@ -40,12 +43,14 @@ public class LayaRouterServiceImpl implements RouterService {
     private final LayaTierClassifier classifier;
     private final PromptBuilder promptBuilder;
     private final WorkerSelector workerSelector;
+    private final Double confidenceThreshold;
 
     public LayaRouterServiceImpl(LayaTierClassifier classifier, PromptBuilder promptBuilder,
-                                 WorkerSelector workerSelector) {
+                                 WorkerSelector workerSelector, LayaRouterProperties properties) {
         this.classifier = classifier;
         this.promptBuilder = promptBuilder;
         this.workerSelector = workerSelector;
+        this.confidenceThreshold = properties.getConfidenceThreshold();
     }
 
     @Override
@@ -56,7 +61,7 @@ public class LayaRouterServiceImpl implements RouterService {
         List<WorkerCandidate> eligible = workerSelector.filterByHints(request.workers(), request.routing());
         long selectionNanos = System.nanoTime() - selectionStarted;
 
-        String prompt = promptBuilder.build(request)
+        String prompt = promptBuilder.build(request, eligible)
                 .orElseThrow(() -> new ResponseStatusException(UNPROCESSABLE_ENTITY,
                         "The routing request contains no message content to route on."));
 
@@ -64,14 +69,16 @@ public class LayaRouterServiceImpl implements RouterService {
         TierDecision decision = classifier.classify(prompt);
         long layaNanos = System.nanoTime() - layaStarted;
 
+        WorkerTier requiredTier = decision.requiredTier(confidenceThreshold);
+
         selectionStarted = System.nanoTime();
-        WorkerCandidate selected = workerSelector.select(decision.tier(), eligible);
+        WorkerCandidate selected = workerSelector.select(requiredTier, eligible);
         selectionNanos += System.nanoTime() - selectionStarted;
 
         // The user's prompt is never logged.
-        log.info("event=routing_decision sessionId={} layaTier={} candidateWorkerCount={} selectedWorkerId={} "
-                        + "layaLatencyMs={} workerSelectionLatencyMs={} totalRoutingLatencyMs={}",
-                request.sessionId(), decision.tier().label(),
+        log.info("event=routing_decision sessionId={} layaTier={} requiredTier={} candidateWorkerCount={} "
+                        + "selectedWorkerId={} layaLatencyMs={} workerSelectionLatencyMs={} totalRoutingLatencyMs={}",
+                request.sessionId(), decision.tier().label(), requiredTier.label(),
                 request.workers() == null ? 0 : request.workers().size(), selected.workerId(),
                 millis(layaNanos), millis(selectionNanos), millis(System.nanoTime() - totalStarted));
         log.debug("event=laya_probabilities sessionId={} probabilities={}", request.sessionId(), decision.probabilities());

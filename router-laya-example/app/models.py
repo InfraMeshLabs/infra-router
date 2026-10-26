@@ -43,10 +43,17 @@ _TIER_RANK = {WorkerTier.SMALL: 0, WorkerTier.MEDIUM: 1, WorkerTier.POWERFUL: 2}
 class RoutingError(Exception):
     """A routing failure reported to Console with an HTTP status (422 / 502), never papered over."""
 
-    def __init__(self, status: int, message: str) -> None:
+    def __init__(self, status: int, message: str, code: Optional[str] = None) -> None:
         super().__init__(message)
         self.status = status
         self.message = message
+        # Machine-readable code for a refusal Console must tell apart from a Router failure.
+        self.code = code
+
+
+# privateData is set but no eligible Worker is LOCAL-only - the same refusal code the Java Routers
+# send. The message never contains the request content.
+PRIVATE_DATA_NO_LOCAL_WORKER = "PRIVATE_DATA_NO_LOCAL_WORKER"
 
 
 class _Contract(BaseModel):

@@ -22,6 +22,7 @@ import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.contains;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -53,7 +54,7 @@ class RouterHttpContractTest {
 
     @Test
     void routeReturnsOnlyTheSelectedWorkerId() throws Exception {
-        when(classifier.classify("hello")).thenReturn(new TierDecision(WorkerTier.MEDIUM, Map.of()));
+        when(classifier.classify(contains("hello"))).thenReturn(new TierDecision(WorkerTier.MEDIUM, Map.of()));
 
         HttpResponse<String> response = post(routingRequest(WORKERS), apiKey);
 
@@ -80,6 +81,21 @@ class RouterHttpContractTest {
         assertThat(post(routingRequest(WORKERS), null).statusCode()).isEqualTo(401);
         assertThat(post(routingRequest(WORKERS), "wrong").statusCode()).isEqualTo(401);
         assertThat(get("/api/v1/health", null).statusCode()).isEqualTo(401);
+    }
+
+    @Test
+    void refusesAPrivateDataRequestWithNoLocalWorkerWithAMachineReadableCode() throws Exception {
+        String externalOnly = WORKERS.replace("\"LOCAL\"", "\"EXTERNAL\"");
+        String body = routingRequest(externalOnly).replace("\"routing\": null", "\"routing\": {\"privateData\": true}");
+
+        HttpResponse<String> response = post(body, apiKey);
+
+        assertThat(response.statusCode()).isEqualTo(422);
+        var json = JsonMapper.shared().readTree(response.body());
+        assertThat(json.get("code").asString()).isEqualTo("PRIVATE_DATA_NO_LOCAL_WORKER");
+        assertThat(json.get("status").asInt()).isEqualTo(422);
+        assertThat(json.get("path").asString()).isEqualTo("/api/v1/route");
+        verify(classifier, never()).classify(any());
     }
 
     @Test

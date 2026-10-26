@@ -14,6 +14,8 @@ public record JevWorkerState(
         String name,
         List<String> models,
         String provider,
+        /** LOCAL, EXTERNAL (request data leaves to an outside AI provider), MIXED or UNKNOWN. */
+        String executionLocation,
         Integer currentRequestCount,
         Integer queueSize,
         BigDecimal averageLatency,

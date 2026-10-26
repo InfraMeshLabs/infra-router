@@ -11,6 +11,17 @@ security:
 
 router:
   laya:
+    # Unset: route to the tier Laya finds most probable. Set (0, 1]: route to the lowest tier
+    # whose cumulative probability (it + every tier below it) reaches the threshold, never below
+    # Laya's choice - so an ambiguous answer escalates. e.g. 0.8 with small 0.30 / medium 0.36 /
+    # powerful 0.34 -> powerful. Probabilities are uncalibrated: tune it on real traffic.
+    # Override with ROUTER_LAYA_CONFIDENCE_THRESHOLD.
+    # confidence-threshold: 0.8
+
+    # Added to the score of a Worker that is not LOCAL-only (any EXTERNAL model, or unknown
+    # location): it wins only when at least this much less loaded. Same as router-static-example.
+    external-penalty: 0.1
+
     # STRICT   - no Worker satisfies the tier Laya asked for -> 422.
     # FALLBACK - no Worker satisfies it -> use the highest tier that is available.
     # Override with ROUTER_LAYA_FALLBACK_POLICY.

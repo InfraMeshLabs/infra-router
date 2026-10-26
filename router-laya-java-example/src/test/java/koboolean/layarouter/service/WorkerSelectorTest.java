@@ -4,9 +4,10 @@ import com.inframesh.node.dto.router.ModelInfo;
 import com.inframesh.node.dto.router.RoutingHints;
 import com.inframesh.node.dto.router.WorkerCandidate;
 import com.inframesh.node.enums.ExecutionLocation;
-import koboolean.layarouter.config.LayaRouterProperties;
 import koboolean.layarouter.config.LayaRouterProperties.FallbackPolicy;
 import koboolean.layarouter.config.LayaRouterProperties.ModelCapabilityRule;
+import koboolean.layarouter.config.LayaRouterProperties;
+import koboolean.layarouter.error.RoutingRejectedException;
 import koboolean.layarouter.laya.WorkerTier;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -44,6 +45,29 @@ class WorkerSelectorTest {
 
     private static WorkerSelector selector() {
         return selector(FallbackPolicy.FALLBACK);
+    }
+
+    @Test
+    void doesNotAssumeAWorkerThatReportsNoMetricsIsIdle() {
+        WorkerCandidate unknown = new WorkerCandidate(1L, "worker-1", null,
+                List.of(new ModelInfo("OLLAMA", SMALL_MODEL, ExecutionLocation.LOCAL)), "OLLAMA",
+                null, null, null, null, null, null, null, null, null, null, null, null, null, null, null);
+        WorkerCandidate busy = candidate(2, SMALL_MODEL, 6, 3, 1500, 80, 80);
+
+        assertThat(selector().select(WorkerTier.SMALL, List.of(unknown, busy)).workerId()).isEqualTo(2L);
+    }
+
+    @Test
+    void scoresACpuOnlyWorkerOnItsCpuAndMemoryUsage() {
+        assertThat(selector().select(WorkerTier.SMALL, List.of(cpuOnly(1, 95, 90), cpuOnly(2, 10, 30))).workerId())
+                .isEqualTo(2L);
+    }
+
+    private static WorkerCandidate cpuOnly(long workerId, int cpuUsage, int memoryUsage) {
+        return new WorkerCandidate(workerId, "worker-" + workerId, null,
+                List.of(new ModelInfo("OLLAMA", SMALL_MODEL, ExecutionLocation.LOCAL)), "OLLAMA", null, null,
+                2, null, null, null, null, "cpu", decimal(cpuUsage), "memory", decimal(memoryUsage),
+                null, null, null, null);
     }
 
     private static WorkerCandidate candidate(long workerId, String model, String provider, Integer requestCount,
@@ -229,7 +253,11 @@ class WorkerSelectorTest {
     void rejectsWhenPrivateDataLeavesNoEligibleWorker() {
         WorkerCandidate external = candidate(1, SMALL_MODEL, "OLLAMA", 0, 0, 0, 0, 0, "gpu", ExecutionLocation.EXTERNAL);
 
-        assertUnprocessable(() -> selector().filterByHints(List.of(external), hints(null, true)));
+        assertThatThrownBy(() -> selector().filterByHints(List.of(external), hints(null, true)))
+                .isInstanceOfSatisfying(RoutingRejectedException.class, e -> {
+                    assertThat(e.getStatusCode().value()).isEqualTo(422);
+                    assertThat(e.nodeError().code()).isEqualTo("PRIVATE_DATA_NO_LOCAL_WORKER");
+                });
     }
 
     @Test

@@ -7,13 +7,16 @@ from fnmatch import fnmatchcase
 from typing import Optional
 
 from app.config import FallbackPolicy, ModelCapabilityRule, ScoreWeights, Settings
-from app.models import RoutingError, RoutingHints, WorkerCandidate, WorkerTier
+from app.models import PRIVATE_DATA_NO_LOCAL_WORKER, RoutingError, RoutingHints, WorkerCandidate, WorkerTier
 
 log = logging.getLogger(__name__)
 
 UNPROCESSABLE_ENTITY = 422
 LOCAL = "LOCAL"
 
+
+# Score of a Worker that reports no metric at all - treated as fully loaded.
+UNKNOWN_LOAD_SCORE = 1.0
 
 class ModelCapabilityRegistry:
     """Maps a model name to the WorkerTier it can serve, from configuration - no model
@@ -54,6 +57,7 @@ class WorkerSelector:
         self._registry = ModelCapabilityRegistry(settings.model_capabilities, settings.default_tier)
         self._weights = settings.weights
         self._fallback_policy = settings.fallback_policy
+        self._external_penalty = settings.external_penalty
 
     # --- RoutingHints filtering -----------------------------------------------------
 
@@ -90,6 +94,7 @@ class WorkerSelector:
                 raise RoutingError(
                     UNPROCESSABLE_ENTITY,
                     "privateData routing hint is set but no worker candidate is LOCAL-only.",
+                    code=PRIVATE_DATA_NO_LOCAL_WORKER,
                 )
 
         if hints.preferred_model and hints.preferred_model.strip():
@@ -162,16 +167,36 @@ class WorkerSelector:
             (_ratio(candidate.current_request_count, max_request_count), weights.request_count),
             (_ratio(candidate.queue_size, max_queue_size), weights.queue_size),
             (_ratio(candidate.average_latency, max_latency), weights.latency),
-            (_percentage(candidate.gpu_usage), weights.gpu_usage),
-            (_percentage(candidate.vram_usage), weights.vram_usage),
+            (_percentage(_compute_usage(candidate)), weights.gpu_usage),
+            (_percentage(_memory_usage(candidate)), weights.vram_usage),
         )
 
         # A missing metric is excluded, not defaulted to 0, and its weight is redistributed
-        # over the metrics the Worker does report - otherwise a CPU-only Worker would look
-        # better than a GPU Worker reporting low usage.
+        # over the metrics the Worker does report - otherwise a Worker would look idle just
+        # because it reports less. A Worker reporting nothing at all is scored as fully loaded.
         weighted_sum = sum(value * weight for value, weight in metrics if value is not None)
         available_weight = sum(weight for value, weight in metrics if value is not None)
-        return weighted_sum / available_weight if available_weight > 0 else 0.0
+        load_score = weighted_sum / available_weight if available_weight > 0 else UNKNOWN_LOAD_SCORE
+        # A Worker that may send the request data to an external AI provider wins only when it
+        # is clearly less loaded - same rule as router-static-example's external-penalty.
+        return load_score if self._is_safe_for_private_data(candidate) else load_score + self._external_penalty
+
+
+# Usage of whatever the Worker runs inference on - same rule as router-static-example: its
+# GPU and VRAM, or CPU and system memory on a CPU-only Worker (system memory also for a GPU
+# with unified memory, which reports no VRAM).
+def _has_gpu(candidate: WorkerCandidate) -> bool:
+    return bool(candidate.gpu and candidate.gpu.strip())
+
+
+def _compute_usage(candidate: WorkerCandidate) -> Optional[float]:
+    return candidate.gpu_usage if _has_gpu(candidate) else candidate.cpu_usage
+
+
+def _memory_usage(candidate: WorkerCandidate) -> Optional[float]:
+    if _has_gpu(candidate) and candidate.vram_usage is not None:
+        return candidate.vram_usage
+    return candidate.memory_usage
 
 
 def _max_of(values) -> float:
