@@ -1,0 +1,54 @@
+server:
+  port: 8094
+infra:
+  node:
+    # Node API key issued by Infra Console. Set INFRA_NODE_API_KEY; the default is a local
+    # development key only.
+    api-key: ${INFRA_NODE_API_KEY:545eb021-94e1-4118-b239-ac3a5bbe2c27}
+
+spring:
+  application:
+    name: infra-router-laya-java
+
+
+router:
+  laya:
+    # Prepared outside this repository by laya-java's scripts/prepare_checkpoint.py - see the
+    # module README. Both must hold english/ and multilingual/. The Router refuses to start
+    # without them.
+    checkpoints-root: ${LAYA_CHECKPOINTS:}
+    onnx-root: ${LAYA_ONNX_ROOT:}
+
+    # Loaded at startup, so no request pays a cold load and a missing graph fails startup.
+    # Laya's Router sends text to english or multilingual by its script/language.
+    preload: [english, multilingual]
+    # Checkpoints resident at once (~1.3-1.7GB of ONNX weights each) - a memory ceiling.
+    max-loaded: 2
+
+    # STRICT   - no Worker satisfies the tier Laya asked for -> 422.
+    # FALLBACK - no Worker satisfies it -> use the highest tier that is available.
+    fallback-policy: ${ROUTER_LAYA_FALLBACK_POLICY:FALLBACK}
+
+    # Tier of a model that matches no rule below, and of a Worker reporting no models.
+    default-tier: small
+
+    # Model -> capability tier, matched case-insensitively against ModelInfo.modelName;
+    # the first matching rule wins. A Worker's tier is the highest tier among its models.
+    # The entries below are examples of the format, not a recommendation. A pattern may use
+    # the wildcards * and ?, e.g. "my-finetune-*".
+    model-capabilities:
+      - pattern: "gemma3:4b"
+        tier: small
+      - pattern: "qwen3:8b"
+        tier: medium
+      - pattern: "qwen3:32b"
+        tier: powerful
+
+    # Load Score weights used to pick among Workers of the same tier. Same metrics,
+    # normalization and defaults as router-static-example; must sum to 1.0.
+    weights:
+      request-count: 0.30
+      queue-size: 0.25
+      latency: 0.20
+      gpu-usage: 0.15
+      vram-usage: 0.10
