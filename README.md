@@ -127,23 +127,39 @@ It listens on port `8091`.
 ### Static Router scoring
 
 The Static Router computes a **Load Score** from five Worker runtime metrics:
-`currentRequestCount`, `queueSize`, `averageLatency`, `gpuUsage`, `vramUsage`. Each metric
-is normalized to a `0.0–1.0` range, then combined with a configurable weight. **The Worker
-with the lowest score is selected** — a low score means more spare capacity.
+`currentRequestCount`, `queueSize`, `averageLatency`, compute usage and memory usage. Each
+metric is normalized to a `0.0–1.0` range, then combined with a configurable weight. **The
+Worker with the lowest score is selected** — a low score means more spare capacity.
 
 - `currentRequestCount`, `queueSize`, `averageLatency` have no fixed maximum, so they are
   normalized relative to the highest value among the current candidate set.
-- `gpuUsage`, `vramUsage` are already reported as a `0–100` percentage, so they are
-  normalized by dividing by `100`.
-- A metric that is `null` for a Worker (most commonly `gpuUsage`/`vramUsage` on a CPU-only
-  Worker) is excluded from that Worker's score, and its weight is redistributed
-  proportionally across that Worker's remaining available metrics — a missing metric is
-  never defaulted to `0`, which would otherwise make a Worker look artificially better
-  just because it doesn't report a metric.
-- Ties (including "no metric available at all") are broken deterministically: lowest score
-  → lowest `queueSize` → lowest `currentRequestCount` → lowest `averageLatency` → lowest
-  `workerId`. There is no random tie-break, so identical input always produces the same
-  routing decision.
+- Compute and memory usage measure whatever the Worker runs inference on: `gpuUsage` /
+  `vramUsage` on a GPU Worker, `cpuUsage` / `memoryUsage` on a CPU-only Worker, and
+  `memoryUsage` for a GPU with unified memory (Apple Silicon reports no VRAM). All are
+  reported as a `0–100` percentage, so they are normalized by dividing by `100`, and are
+  weighted by `gpu-usage` / `vram-usage`.
+- A metric that is `null` for a Worker is excluded from that Worker's score, and its weight is
+  redistributed proportionally across that Worker's remaining available metrics — a missing
+  metric is never defaulted to `0`, which would otherwise make a Worker look artificially
+  better just because it doesn't report a metric. Console does not populate `queueSize` or
+  `averageLatency` yet, so today the score is effectively `currentRequestCount` (55%), compute
+  usage (27%) and memory usage (18%).
+- A Worker that reports **no metric at all** is scored as fully loaded (`1.0`), as Console's
+  own `LEAST_BUSY` strategy does — unknown load is never assumed to be idle.
+- **Execution location** is scored too. A Worker that is not LOCAL-only — any `EXTERNAL`
+  model, or a model / Worker whose `executionLocation` is unknown — may send the request data
+  to an outside AI provider, so `router.static.external-penalty` (default `0.1`) is added to
+  its score: it wins only when it is at least that much less loaded. `0` ignores the location;
+  `1` uses such a Worker only when no LOCAL-only one remains. The penalty only matters under
+  [`dataRoutingPolicy: EXTERNAL_ALLOWED`](#data-routing-policy): with `privateData`,
+  `INTERNAL_ONLY` or `AUTO` (also a request without the field) such a Worker is not eligible
+  at all (hard filter, below).
+- `throughput` and `errorCount` are not scored: Console does not populate them yet, and
+  `errorCount` is a lifetime total that would penalize a Worker for its age rather than its
+  current health.
+- Ties are broken deterministically: lowest score → lowest `queueSize` → lowest
+  `currentRequestCount` → lowest `averageLatency` → lowest `workerId`. There is no random
+  tie-break, so identical input always produces the same routing decision.
 
 Weights are configured in `router-static-example/src/main/resources/application.yml`
 instead of being hardcoded, and must sum to `1.0` (validated at startup):
@@ -151,6 +167,7 @@ instead of being hardcoded, and must sum to `1.0` (validated at startup):
 ```yaml
 router:
   static:
+    external-penalty: 0.1   # added to the score of a Worker that is not LOCAL-only
     weights:
       request-count: 0.30
       queue-size: 0.25
@@ -160,7 +177,7 @@ router:
 ```
 
 `RoutingHints` are still respected before scoring: `requiredProvider`, `gpuRequired` and
-`privateData` are hard filters (a Worker that fails one is removed from candidates, and
+the LOCAL-only requirement (`privateData` / [`dataRoutingPolicy`](#data-routing-policy)) are hard filters (a Worker that fails one is removed from candidates, and
 routing fails with `422` if no candidate remains), while `preferredModel` is a soft
 preference that only narrows the candidate set when at least one remaining candidate
 actually supports that model.
@@ -186,7 +203,13 @@ text, it answers typed questions (Choice / Score / Noul) over a piece of state a
 a selected option with calibrated probabilities and confidence. This Router asks a single
 Choice question — "which of these eligible Workers fits this request best" — with one
 option per eligible candidate (`worker_<id>`) and that candidate's
-`currentRequestCount`/`queueSize`/`averageLatency`/`gpuUsage`/`vramUsage` as state. Jev is
+`executionLocation`/`currentRequestCount`/`queueSize`/`averageLatency`/`gpuUsage`/`vramUsage`
+as state. `executionLocation` summarizes the Worker's models as `LOCAL`, `EXTERNAL`, `MIXED`
+or `UNKNOWN`, and the instructions ask Jev to prefer `LOCAL` Workers. Jev never sees the
+request messages: it is an external API, so asking it whether the content may leave the
+organization would already have sent the content out. Sensitive content is guarded only by
+the LOCAL-only hard filter here - `privateData` and [`dataRoutingPolicy`](#data-routing-policy)
+(see [Sensitive data detection](#sensitive-data-detection)). Jev is
 called directly over HTTP (`POST /v1/systemone`) via `WebClient` — it is not wrapped as a
 Spring AI `ChatModel`, since it isn't a chat/completion model.
 
@@ -215,8 +238,9 @@ jev:
 
 ### Policy split and fallback
 
-Exactly like the other two Router examples, `requiredProvider`, `gpuRequired` and
-`privateData` are enforced as hard filters **in Java, before Jev is ever called**, and
+Exactly like the other Router examples, `requiredProvider`, `gpuRequired` and the LOCAL-only
+requirement (`privateData` / `dataRoutingPolicy`) are enforced as hard filters **in Java, before
+Jev is ever called**, and
 `preferredModel` is resolved as a soft preference in Java too. Jev is a decision layer over
 already-eligible candidates, never the thing that decides whether a policy is satisfied —
 and its answer is only trusted if it names a Worker that was actually offered.
@@ -224,7 +248,7 @@ and its answer is only trusted if it names a Worker that was actually offered.
 Jev is an external HTTP call, so it can time out, rate-limit, or fail outright. Rather than
 let a routing decision hang or fail the whole request over a transient API problem, any Jev
 failure (timeout, connection error, non-2xx, unusable response) **or an unrecognized Worker
-choice** falls back to a small deterministic ordering: lowest `queueSize` → lowest
+choice** falls back to a small deterministic ordering: LOCAL-only Workers first → lowest `queueSize` → lowest
 `currentRequestCount` → lowest `averageLatency` → lowest `workerId`. This is intentionally
 *not* the full weighted/configurable algorithm from `router-static-example` — copying that
 module's scoring here would create two competing sources of truth for the same policy — so
@@ -406,12 +430,21 @@ repositories {
 }
 
 dependencies {
-    implementation 'io.github.inframeshai:inframesh-node:0.1.4'
+    implementation 'io.github.inframeshai:inframesh-node:0.1.6'
 }
 ```
 
 A Router that is not written in Java (see `router-laya-example`) cannot use the artifact and
-instead mirrors the same `0.1.1` JSON contract field for field.
+instead mirrors the same `0.1.1` JSON contract field for field, plus `dataRoutingPolicy`.
+
+The Java Router examples use `0.1.6`: `0.1.5` added `NodeErrorCarrier` so an OUTBOUND Router can
+send its own `NodeError.code` (see [Error codes](#error-codes-for-refused-requests)), and `0.1.6`
+adds `RoutingRequest.dataRoutingPolicy` (see [Data routing policy](#data-routing-policy)). Until a version is on Maven Central, publish it
+locally from the `infra-node` repository first (the root build also reads `mavenLocal()`):
+
+```bash
+cd ../infra-node && ./gradlew publishToMavenLocal
+```
 
 Custom Router implementations should always use the contracts provided by `infra-node`.
 
@@ -659,6 +692,10 @@ RoutingRequest
 └── workers       List<WorkerCandidate>
 ```
 
+`infra-node` `0.1.6` adds `dataRoutingPolicy` (`AUTO` | `INTERNAL_ONLY` | `EXTERNAL_ALLOWED`;
+missing / `null` = `AUTO`) - the Team's rule from Console, never client input. See
+[Data routing policy](#data-routing-policy).
+
 Field names are the JSON property names; enums are sent as their names. A missing or `null`
 `tools` / `workers` list is read as an empty list.
 
@@ -886,6 +923,191 @@ Any field other than `workerId` may be `null` — most commonly `gpu` / `gpuUsag
 `vramUsage` on a CPU-only Worker — and a Router must not treat a missing metric as `0`.
 An unknown `executionLocation` must be treated as unsafe for `privateData` requests.
 
+#### Execution location in the reference Routers
+
+`ModelInfo.executionLocation` says whether a model runs on infrastructure the user controls
+(`LOCAL`) or sends the request data to an outside AI provider (`EXTERNAL`). A Worker is
+**LOCAL-only** when it has at least one model and every model is `LOCAL`; anything else —
+an `EXTERNAL` model, a `null` location, or no models — counts as able to send data out
+(fail-closed).
+
+Every Router keeps LOCAL-only Workers only (422 if none) when `privateData` is `true`, or when
+[`dataRoutingPolicy`](#data-routing-policy) is `INTERNAL_ONLY` or `AUTO` (also when it is
+missing). Only under `EXTERNAL_ALLOWED` do other Workers stay eligible, and then:
+
+| Router | `EXTERNAL_ALLOWED`, no `privateData` |
+|---|---|
+| `router-static-example` | `external-penalty` added to the score of a Worker that is not LOCAL-only |
+| `router-laya-example` / `router-laya-java-example` | `external-penalty` as in the Static Router. Laya does not judge the content (see below) |
+| `router-jev-example` | `executionLocation` is part of Jev's state; the instructions and the fallback prefer `LOCAL` |
+| `router-spring-ai-example` | Each candidate carries `localOnly`, and the prompt prefers it - also when the model finds the content sensitive. Its `sensitiveData` answer is logged, never a reason to refuse: the Team allowed other Workers |
+
+Only the Spring AI Router judges the content itself - see the next section for why, and for
+what that judgement can and cannot do.
+
+#### Sensitive data detection
+
+**No Router can guarantee that sensitive data is detected.** Whether text is sensitive depends on
+context (a customer name, an internal project, a diagnosis, a contract amount), a detector that
+says "not sensitive" lets the data out with no trace, and a model's judgement can be steered by
+the text it is judging. The guarantee therefore comes from policy, not detection:
+
+- **`privateData: true`** - the caller marks the request; every Router (and Console, for its
+  built-in strategies) sends it to LOCAL-only Workers or refuses it with
+  `422 PRIVATE_DATA_NO_LOCAL_WORKER`.
+- **Team policy** - a team that handles sensitive data is assigned LOCAL-only Workers, or set to
+  [`dataRoutingPolicy: INTERNAL_ONLY`](#data-routing-policy), so no request of that team can
+  reach an external provider whatever any detector decides.
+
+No Router refuses a request on an automatic judgement of its content today; `AUTO` would be
+the place for one (see [Data routing policy](#data-routing-policy)), and until a checker exists it
+keeps the request on LOCAL-only Workers without judging:
+
+| Router | Judges the content | Why |
+|---|---|---|
+| Spring AI | yes, best-effort, as a preference only | Its routing model already reads the messages (a local Ollama model by default), so asking for `sensitiveData` in the same answer costs no extra call and sends the content nowhere new. The prompt asks the model to prefer a LOCAL-only Worker for sensitive content; the answer is logged but never refuses a request. It comes back with the Worker choice, so it cannot serve as the `AUTO` check (which must narrow the candidates first), and under `EXTERNAL_ALLOWED` the Team has allowed other Workers |
+| Laya | **no** | Measured unfit for it (below) |
+| Jev | no | An external API that never receives the messages - asking would send the content out first |
+| Static | no | No model to judge with |
+
+**Why Laya does not judge sensitivity.** Laya was asked a yes/no question ("Does this request
+contain credentials, personal data or other sensitive information…?") alongside the tier
+question, and measured on the real `english` + `multilingual` checkpoints with 13 Korean and
+English messages - 7 that only *mention* a sensitive topic, 6 that carry an actual value. The
+table shows Laya's probability of "sensitive" (`0.5` and above was treated as sensitive) for the
+question that was shipped and for a rewording that asks for "an actual secret value or real
+personal data" with explicit yes/no criteria (two other rewordings flagged the same Korean
+questions at 0.94-1.00), next to the
+Spring AI Router's local model (`gemma4:e4b`) given the same instruction:
+
+| Message | Truth | Laya (shipped question) | Laya (reworded) | `gemma4:e4b` |
+|---|---|---|---|---|
+| 비밀번호를 잊어버렸어요. 어떻게 재설정하나요? | not sensitive | **0.68** | **0.94** | false |
+| 안전한 비밀번호를 만드는 방법을 알려줘 | not sensitive | **0.99** | **1.00** | false |
+| 비밀번호 정책은 몇 자리 이상이 좋을까? | not sensitive | **0.94** | **1.00** | false |
+| 주민등록번호 형식에 대해 설명해줘 | not sensitive | 0.00 | **0.93** | false |
+| How do I reset my password? | not sensitive | 0.19 | **0.60** | false |
+| 제 주민등록번호는 900101-…, 전화번호는 010-… | sensitive | **0.00** | 0.98 | true |
+| My password is hunter2, is it strong? | sensitive | 0.53 | 0.75 | true |
+
+Bold is wrong. Laya classifies what a text is *about*: every wording flagged Korean questions
+that only mention passwords (0.94-1.00), the shipped one also missed an actual national ID and
+phone number (0.00), and the probability ranges of right and wrong answers overlap, so no
+threshold separates them. Fine-tuning Laya on labelled examples is possible (`laya.train`) but
+would need both checkpoints retrained, risks the tier accuracy, and would have to be redone on
+every Laya upgrade. Laya therefore routes on the tier only.
+
+The local model answered all 13 correctly (about 0.2 s each once loaded) - 13 messages show it is
+far better than Laya at this, **not** that it catches everything. It is a candidate for an `AUTO`
+sensitivity checker, never a reason a request is safe to send out.
+
+#### Data routing policy
+
+Console sends each Team's `dataRoutingPolicy` on `RoutingRequest` (`infra-node` `0.1.6`, the
+`AI_ROUTER` strategy only). It only narrows the candidates; the Router's own decision - Laya's
+complexity tier, tier mapping, `preferredModel`, `requiredProvider`, `gpuRequired`, Load Score,
+fallback, tie-break - then runs unchanged on what is left. Every Router in this repository
+applies it with the same rule and codes. In Static, Jev and Spring AI, the Router's own
+decision - Load Score, Jev's choice, the model's choice - runs on the filtered candidates in
+the same way, so Jev and the model are never offered an excluded Worker.
+
+| `privateData` | `dataRoutingPolicy` | Non-LOCAL Workers allowed | Content judged |
+|---|---|---|---|
+| `true` | any | no | no |
+| `false` / missing | `INTERNAL_ONLY` | no | no |
+| `false` / missing | `AUTO` / missing | only when judged not sensitive | yes |
+| `false` / missing | `EXTERNAL_ALLOWED` | yes (not preferred - each Router's LOCAL preference, e.g. `external-penalty`, still applies) | no (Spring AI's model still answers `sensitiveData`; logged, never refuses) |
+
+```text
+RoutingRequest
+   │
+   ├─ privateData = true ───────────────► LOCAL-only
+   ├─ INTERNAL_ONLY ────────────────────► LOCAL-only
+   ├─ EXTERNAL_ALLOWED ─────────────────► all candidates
+   └─ AUTO ─► sensitivity check ─┬─ NOT_SENSITIVE ─► all candidates
+                                 └─ SENSITIVE / UNKNOWN / failure ─► LOCAL-only
+   │
+   ▼
+requiredProvider / gpuRequired → LOCAL-only filter → preferredModel (soft)
+   │
+   ▼
+Laya tier → tier mapping + fallback → Load Score → selected Worker re-checked
+```
+
+- **LOCAL-only** is the [execution location](#execution-location-in-the-reference-routers) rule
+  above. The filter runs before the soft preference and the tier fallback, so neither brings back
+  a Worker it removed, and the selected Worker is checked again before it is returned.
+- **No fallback to external Workers.** When no LOCAL-only Worker is left the request is refused
+  with a [code](#error-codes-for-refused-requests) that names the reason.
+- **AUTO fails closed.** The sensitivity check is a `SensitivityChecker` (Java bean) /
+  `sensitivity_checker` (Python `create_app` argument) that must run locally. A failure, a
+  timeout, a missing or uncertain verdict counts as sensitive; the failure is logged
+  (`event=sensitivity_check_failed`) with the exception type only, never the content.
+- **No Router ships a sensitivity checker** - Laya is not one ([above](#sensitive-data-detection)),
+  and choosing a model for it is a separate decision. The Laya Routers accept one; Static, Jev
+  and Spring AI have no hook for it. Until one is configured, **AUTO behaves exactly like
+  INTERNAL_ONLY**, and so does a request without `dataRoutingPolicy` (an older Console): such a
+  request is refused with `SENSITIVITY_UNVERIFIED_NO_LOCAL_WORKER` when the Team has no
+  LOCAL-only Worker. The Laya Routers log a startup warning saying so.
+- **Behavior change.** Before `dataRoutingPolicy`, a request without `privateData` could reach a
+  Worker that is not LOCAL-only in every Router (Static and Laya with `external-penalty`, Jev and
+  Spring AI by their own choice). Now that needs `EXTERNAL_ALLOWED`; a Team that relies on
+  external Workers must be set to it in Console.
+- An unknown value (`"SOMETIMES"`, `"auto"` - names are case-sensitive) is a `400` with
+  `Malformed RoutingRequest: dataRoutingPolicy must be one of [AUTO, INTERNAL_ONLY, EXTERNAL_ALLOWED].`
+  over DIRECT, and infra-node's `MALFORMED_PAYLOAD` over OUTBOUND.
+- `RoutingResponse` is unchanged (`workerId` only). Console can check `privateData` and
+  `INTERNAL_ONLY` against the candidates it sent; whether AUTO allowed a non-LOCAL Worker is not
+  in the response.
+- **`EXTERNAL_ALLOWED` is not narrowed by any content judgement.** The Spring AI model's
+  `sensitiveData` answer only shapes its preference and is logged; it never refuses a request.
+  Only `privateData: true` still holds an `EXTERNAL_ALLOWED` request to LOCAL-only Workers.
+- The Laya and Spring AI Routers' routing log line carries `dataRoutingPolicy` and `localOnly`
+  (the requirement's code, or `none`).
+- End to end with a real Console, every Router and both connection modes are covered by the
+  Console's opt-in tests `DataRoutingPolicyLayaE2ETest` (`INFRAMESH_LAYA_ROUTER_E2E=true`) and
+  `DataRoutingPolicyRouterE2ETest` (`INFRAMESH_ROUTER_E2E=true`; Static, Jev with a stand-in Jev
+  API, Spring AI with the local Ollama model).
+
+#### Error codes for refused requests
+
+When a Router refuses a request for a policy reason, it answers `422` with a machine-readable
+code, so Console can tell the refusal apart from a Router failure and report it to the caller
+instead of a generic error. The codes are the same in every Router, and the message never
+contains the request content.
+
+| Code | When | Routers |
+|---|---|---|
+| `PRIVATE_DATA_NO_LOCAL_WORKER` | `privateData` is `true` but no eligible Worker is LOCAL-only (wins over the codes below) | all |
+| `INTERNAL_ONLY_NO_LOCAL_WORKER` | `dataRoutingPolicy` is `INTERNAL_ONLY` but no eligible Worker is LOCAL-only | all |
+| `SENSITIVE_DATA_NO_LOCAL_WORKER` | the Router judged the content sensitive but no eligible Worker is LOCAL-only | Laya, only with a configured `AUTO` sensitivity checker (none ships) |
+| `SENSITIVITY_UNVERIFIED_NO_LOCAL_WORKER` | `dataRoutingPolicy` is `AUTO` (or missing), the content could not be judged not sensitive (no checker configured, a failure, an uncertain result), and no eligible Worker is LOCAL-only | all |
+
+DIRECT — `POST /api/v1/route` answers with Spring Boot's error shape plus `code`:
+
+```json
+{
+  "timestamp": "2026-10-26T12:00:00Z",
+  "status": 422,
+  "error": "Unprocessable Entity",
+  "code": "PRIVATE_DATA_NO_LOCAL_WORKER",
+  "message": "privateData routing hint is set but no worker candidate is LOCAL-only.",
+  "path": "/api/v1/route"
+}
+```
+
+OUTBOUND — the `ERROR` envelope's `NodeError` carries the same code (infra-node `0.1.5`+, through
+`NodeErrorCarrier`):
+
+```json
+{"code": "PRIVATE_DATA_NO_LOCAL_WORKER", "message": "privateData routing hint is set but no worker candidate is LOCAL-only."}
+```
+
+In the Java Routers both come from one exception, `RoutingRejectedException` (a
+`ResponseStatusException` implementing `NodeErrorCarrier`), rendered by `RoutingErrorHandler`.
+Every other Router error keeps its current shape: Spring Boot's default body without `code`
+over DIRECT, `NodeError("REQUEST_FAILED", …)` over OUTBOUND.
+
 This allows Router implementations to make decisions using both the Worker's models and its dynamic runtime state.
 
 For example:
@@ -1020,7 +1242,7 @@ Candidates
 Filter by required provider
     │
     ▼
-Filter by gpuRequired / privateData
+Filter by gpuRequired / LOCAL-only (privateData, dataRoutingPolicy)
     │
     ▼
 Prefer requested model
@@ -1142,7 +1364,7 @@ In `infra-node` `0.1.1` it has exactly one field, the numeric id of the selected
 ```
 
 Router-specific details (scores, tiers, model output, confidence) are not part of the
-response; they belong in the Router's own logs.
+response; they belong in the Router's own logs. `dataRoutingPolicy` adds no field either.
 
 For example:
 
@@ -1608,7 +1830,7 @@ Start by adding the `infra-node` dependency to the Router project.
 
 ```gradle
 dependencies {
-    implementation 'io.github.inframeshai:inframesh-node:0.1.4'
+    implementation 'io.github.inframeshai:inframesh-node:0.1.6'
 }
 ```
 

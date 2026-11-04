@@ -8,7 +8,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.config import FallbackPolicy, ModelCapabilityRule, Settings
-from app.laya_router import QUESTIONS, WARM_UP_PROMPT, LayaRouter
+from app.laya_router import QUESTIONS, WARM_UP_PROMPT, LayaRouter, TierDecision
 from app.main import create_app
 from app.models import ChatMessage, RoutingError, RoutingRequest, WorkerTier
 from app.prompt_builder import PromptBuilder
@@ -114,6 +114,37 @@ def test_refuses_to_classify_before_warm_up():
 # --- PromptBuilder ------------------------------------------------------------------------
 
 
+def _decision(tier, small, medium, powerful):
+    return TierDecision(tier=tier, probabilities={"small": small, "medium": medium, "powerful": powerful})
+
+
+@pytest.mark.parametrize(
+    "decision, threshold, expected",
+    [
+        # No threshold: Laya's choice.
+        (_decision(WorkerTier.MEDIUM, 0.30, 0.36, 0.34), None, WorkerTier.MEDIUM),
+        # A confident choice is kept.
+        (_decision(WorkerTier.MEDIUM, 0.05, 0.90, 0.05), 0.8, WorkerTier.MEDIUM),
+        # An ambiguous choice escalates.
+        (_decision(WorkerTier.MEDIUM, 0.30, 0.36, 0.34), 0.8, WorkerTier.POWERFUL),
+        # Never below Laya's choice.
+        (_decision(WorkerTier.POWERFUL, 0.00, 0.40, 0.60), 0.3, WorkerTier.POWERFUL),
+        # No probabilities: Laya's choice.
+        (TierDecision(tier=WorkerTier.SMALL), 0.8, WorkerTier.SMALL),
+        # Rounding keeps the total under the threshold: the most capable tier.
+        (_decision(WorkerTier.SMALL, 0.5, 0.2, 0.2999), 1.0, WorkerTier.POWERFUL),
+    ],
+)
+def test_required_tier_escalates_an_ambiguous_answer(decision, threshold, expected):
+    assert decision.required_tier(threshold) == expected
+
+
+@pytest.mark.parametrize("threshold", [0.0, -0.1, 1.5])
+def test_confidence_threshold_must_be_in_the_unit_interval(threshold):
+    with pytest.raises(ValueError):
+        Settings(security_enabled=False, confidence_threshold=threshold)
+
+
 def test_prompt_is_the_last_user_message():
     request = RoutingRequest(messages=[
         ChatMessage(role="SYSTEM", content="You are helpful."),
@@ -134,10 +165,10 @@ def test_prompt_is_none_when_there_is_no_message_content():
 # --- HTTP contract ------------------------------------------------------------------------
 
 
-def worker(worker_id, model):
+def worker(worker_id, model, location="LOCAL", request_count=0):
     return {"workerId": worker_id, "name": f"worker-{worker_id}", "provider": "OLLAMA",
-            "models": [{"provider": "OLLAMA", "modelName": model, "executionLocation": "LOCAL"}],
-            "currentRequestCount": 0, "queueSize": 0, "averageLatency": 120.5,
+            "models": [{"provider": "OLLAMA", "modelName": model, "executionLocation": location}],
+            "currentRequestCount": request_count, "queueSize": 0, "averageLatency": 120.5,
             "someFutureField": "ignored"}
 
 

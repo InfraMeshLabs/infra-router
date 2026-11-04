@@ -23,11 +23,14 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  */
 class LayaTierClassifierTest {
 
+    private static final String SYSTEM_PROMPT = "Which worker class is most appropriate for this request?";
+
     private static final Map<String, Double> PROBABILITIES = Map.of("small", 0.1, "medium", 0.6, "powerful", 0.3);
 
     static class FakeEngine implements Predictor {
 
         final List<String> prompts = new ArrayList<>();
+        Map<String, Question> questions;
         Answer answer;
         RuntimeException error;
 
@@ -37,7 +40,7 @@ class LayaTierClassifierTest {
 
         @Override
         public Prediction predict(Object state, Map<String, Question> questions) {
-            assertThat(questions).isSameAs(LayaTierClassifier.QUESTIONS);
+            this.questions = questions;
             prompts.add((String) state);
             if (error != null && !LayaTierClassifier.WARM_UP_PROMPT.equals(state)) {
                 throw error;
@@ -47,7 +50,7 @@ class LayaTierClassifierTest {
     }
 
     private static LayaTierClassifier warmedUp(FakeEngine engine) {
-        LayaTierClassifier classifier = new LayaTierClassifier(() -> engine);
+        LayaTierClassifier classifier = new LayaTierClassifier(() -> engine, SYSTEM_PROMPT);
         classifier.warmUp();
         return classifier;
     }
@@ -59,7 +62,7 @@ class LayaTierClassifierTest {
         LayaTierClassifier classifier = new LayaTierClassifier(() -> {
             created.incrementAndGet();
             return engine;
-        });
+        }, SYSTEM_PROMPT);
 
         assertThat(classifier.isReady()).isFalse();
 
@@ -76,7 +79,7 @@ class LayaTierClassifierTest {
     void isNotReadyWhenWarmUpFails() {
         LayaTierClassifier classifier = new LayaTierClassifier(() -> (state, questions) -> {
             throw new IllegalStateException("graph not found");
-        });
+        }, SYSTEM_PROMPT);
 
         assertThatThrownBy(classifier::warmUp).isInstanceOf(IllegalStateException.class);
         assertThat(classifier.isReady()).isFalse();
@@ -93,7 +96,9 @@ class LayaTierClassifierTest {
 
     @Test
     void offersTheThreeTiersInCapabilityOrder() {
-        Question question = LayaTierClassifier.QUESTIONS.get(LayaTierClassifier.QUESTION_KEY);
+        FakeEngine engine = new FakeEngine("small");
+        warmedUp(engine);
+        Question question = engine.questions.get(LayaTierClassifier.QUESTION_KEY);
 
         assertThat(question.labels()).containsExactly("small", "medium", "powerful");
     }
@@ -131,7 +136,7 @@ class LayaTierClassifierTest {
 
     @Test
     void refusesToClassifyBeforeWarmUp() {
-        assertBadGateway(new LayaTierClassifier(() -> new FakeEngine("small")));
+        assertBadGateway(new LayaTierClassifier(() -> new FakeEngine("small"), SYSTEM_PROMPT));
     }
 
     @Test

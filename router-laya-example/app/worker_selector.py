@@ -7,13 +7,18 @@ from fnmatch import fnmatchcase
 from typing import Optional
 
 from app.config import FallbackPolicy, ModelCapabilityRule, ScoreWeights, Settings
+from app.data_routing import PRIVATE_DATA_REQUIREMENT, LocalOnlyRequirement
 from app.models import RoutingError, RoutingHints, WorkerCandidate, WorkerTier
 
 log = logging.getLogger(__name__)
 
 UNPROCESSABLE_ENTITY = 422
+INTERNAL_SERVER_ERROR = 500
 LOCAL = "LOCAL"
 
+
+# Score of a Worker that reports no metric at all - treated as fully loaded.
+UNKNOWN_LOAD_SCORE = 1.0
 
 class ModelCapabilityRegistry:
     """Maps a model name to the WorkerTier it can serve, from configuration - no model
@@ -41,7 +46,9 @@ class WorkerSelector:
 
     RoutingHints are enforced exactly like the other Router examples: ``requiredProvider``,
     ``gpuRequired`` and ``privateData`` are hard filters (422 when nothing is left) and
-    ``preferredModel`` is a soft preference.
+    ``preferredModel`` is a soft preference. A LocalOnlyRequirement (privateData or the Team's
+    DataRoutingPolicy - see ``app.data_routing``) is the LOCAL-only hard filter, applied before
+    the soft preference and the tier fallback, so neither can bring back a Worker it removed.
 
     For the tier Laya asked for, the Workers of the closest tier that is at least as
     capable are used (a SMALL request does not occupy a POWERFUL Worker while a SMALL one
@@ -54,16 +61,22 @@ class WorkerSelector:
         self._registry = ModelCapabilityRegistry(settings.model_capabilities, settings.default_tier)
         self._weights = settings.weights
         self._fallback_policy = settings.fallback_policy
+        self._external_penalty = settings.external_penalty
 
     # --- RoutingHints filtering -----------------------------------------------------
 
     def filter_by_hints(
-        self, candidates: Optional[list[WorkerCandidate]], hints: Optional[RoutingHints]
+        self,
+        candidates: Optional[list[WorkerCandidate]],
+        hints: Optional[RoutingHints],
+        local_only: Optional[LocalOnlyRequirement] = None,
     ) -> list[WorkerCandidate]:
         if not candidates:
             raise RoutingError(UNPROCESSABLE_ENTITY, "No worker candidates were provided for routing.")
-        if hints is None:
-            return candidates
+        # privateData restricts on its own even when no requirement is passed in.
+        if local_only is None and hints is not None and hints.private_data is True:
+            local_only = PRIVATE_DATA_REQUIREMENT
+        hints = hints or RoutingHints()
 
         eligible = candidates
 
@@ -84,13 +97,10 @@ class WorkerSelector:
                     "gpuRequired routing hint is set but no worker candidate reports a GPU.",
                 )
 
-        if hints.private_data is True:
-            eligible = [c for c in eligible if self._is_safe_for_private_data(c)]
+        if local_only is not None:
+            eligible = [c for c in eligible if self._is_local_only(c)]
             if not eligible:
-                raise RoutingError(
-                    UNPROCESSABLE_ENTITY,
-                    "privateData routing hint is set but no worker candidate is LOCAL-only.",
-                )
+                raise RoutingError(UNPROCESSABLE_ENTITY, local_only.reason, code=local_only.code)
 
         if hints.preferred_model and hints.preferred_model.strip():
             preferred = hints.preferred_model.lower()
@@ -101,8 +111,17 @@ class WorkerSelector:
 
         return eligible
 
+    def verify_selection(self, selected: WorkerCandidate, local_only: Optional[LocalOnlyRequirement]) -> None:
+        """Last check on the Worker actually selected. Failing it is a Router bug, never a
+        reason to send data out."""
+        if local_only is not None and not self._is_local_only(selected):
+            raise RoutingError(
+                INTERNAL_SERVER_ERROR,
+                f"Selected worker {selected.worker_id} is not LOCAL-only but the request requires it.",
+            )
+
     @staticmethod
-    def _is_safe_for_private_data(candidate: WorkerCandidate) -> bool:
+    def _is_local_only(candidate: WorkerCandidate) -> bool:
         # Fail closed: no models, or any model that is not known to be LOCAL, is unsafe.
         models = candidate.models or []
         return bool(models) and all(model.execution_location == LOCAL for model in models)
@@ -162,16 +181,36 @@ class WorkerSelector:
             (_ratio(candidate.current_request_count, max_request_count), weights.request_count),
             (_ratio(candidate.queue_size, max_queue_size), weights.queue_size),
             (_ratio(candidate.average_latency, max_latency), weights.latency),
-            (_percentage(candidate.gpu_usage), weights.gpu_usage),
-            (_percentage(candidate.vram_usage), weights.vram_usage),
+            (_percentage(_compute_usage(candidate)), weights.gpu_usage),
+            (_percentage(_memory_usage(candidate)), weights.vram_usage),
         )
 
         # A missing metric is excluded, not defaulted to 0, and its weight is redistributed
-        # over the metrics the Worker does report - otherwise a CPU-only Worker would look
-        # better than a GPU Worker reporting low usage.
+        # over the metrics the Worker does report - otherwise a Worker would look idle just
+        # because it reports less. A Worker reporting nothing at all is scored as fully loaded.
         weighted_sum = sum(value * weight for value, weight in metrics if value is not None)
         available_weight = sum(weight for value, weight in metrics if value is not None)
-        return weighted_sum / available_weight if available_weight > 0 else 0.0
+        load_score = weighted_sum / available_weight if available_weight > 0 else UNKNOWN_LOAD_SCORE
+        # A Worker that may send the request data to an external AI provider wins only when it
+        # is clearly less loaded - same rule as router-static-example's external-penalty.
+        return load_score if self._is_local_only(candidate) else load_score + self._external_penalty
+
+
+# Usage of whatever the Worker runs inference on - same rule as router-static-example: its
+# GPU and VRAM, or CPU and system memory on a CPU-only Worker (system memory also for a GPU
+# with unified memory, which reports no VRAM).
+def _has_gpu(candidate: WorkerCandidate) -> bool:
+    return bool(candidate.gpu and candidate.gpu.strip())
+
+
+def _compute_usage(candidate: WorkerCandidate) -> Optional[float]:
+    return candidate.gpu_usage if _has_gpu(candidate) else candidate.cpu_usage
+
+
+def _memory_usage(candidate: WorkerCandidate) -> Optional[float]:
+    if _has_gpu(candidate) and candidate.vram_usage is not None:
+        return candidate.vram_usage
+    return candidate.memory_usage
 
 
 def _max_of(values) -> float:

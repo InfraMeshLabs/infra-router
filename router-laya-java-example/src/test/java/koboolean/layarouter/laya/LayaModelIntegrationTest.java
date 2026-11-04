@@ -33,7 +33,7 @@ class LayaModelIntegrationTest {
         classifier = new LayaTierClassifier(() -> Router.builder()
                 .checkpointsRoot(Path.of(checkpoints), Path.of(graphs))
                 .build()
-                .preload(List.of("english", "multilingual")));
+                .preload(List.of("english", "multilingual")), "Which worker class is most appropriate for this request?");
         classifier.warmUp();
     }
 

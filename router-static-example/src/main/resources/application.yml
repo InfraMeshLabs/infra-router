@@ -12,9 +12,15 @@ spring:
 
 router:
   static:
+    # Added to the score of a Worker that is not LOCAL-only (any EXTERNAL model, or unknown
+    # location): it wins only when at least this much less loaded. 0 ignores the location,
+    # 1 uses it only when no LOCAL-only Worker remains.
+    external-penalty: 0.1
     weights:
       request-count: 0.30
       queue-size: 0.25
       latency: 0.20
+      # Compute / memory usage of whatever the Worker runs inference on: GPU / VRAM usage, or
+      # CPU / system memory usage on a CPU-only Worker (and system memory for unified memory).
       gpu-usage: 0.15
       vram-usage: 0.10

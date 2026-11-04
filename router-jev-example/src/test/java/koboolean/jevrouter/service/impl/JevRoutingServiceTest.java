@@ -6,10 +6,13 @@ import com.inframesh.node.dto.router.RoutingHints;
 import com.inframesh.node.dto.router.RoutingRequest;
 import com.inframesh.node.dto.router.RoutingResponse;
 import com.inframesh.node.dto.router.WorkerCandidate;
+import com.inframesh.node.enums.DataRoutingPolicy;
 import com.inframesh.node.enums.ExecutionLocation;
 import koboolean.jevrouter.client.JevClient;
 import koboolean.jevrouter.client.JevClientException;
 import koboolean.jevrouter.dto.JevChoiceResponse.ChoiceAnswer;
+import koboolean.jevrouter.dto.JevWorkerState;
+import koboolean.jevrouter.error.RoutingRejectedException;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
@@ -26,6 +29,7 @@ import java.util.Set;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -92,6 +96,34 @@ class JevRoutingServiceTest {
     }
 
     @Test
+    void tellsJevWhereEachWorkerRunsItsModels() {
+        WorkerCandidate localOnly = candidateWithModel(1L, local("OLLAMA", "qwen3"));
+        WorkerCandidate externalOnly = candidateWithModel(2L, external("OPENAI", "gpt-4o"));
+        WorkerCandidate unknown = candidateWithModel(3L, new ModelInfo("OLLAMA", "qwen3", null));
+        respondWith("worker_1", 0.9);
+
+        service.route(externalAllowed(List.of(localOnly, externalOnly, unknown)));
+
+        verify(jevClient).chooseWorker(
+                argThat(state -> state instanceof List<?> list && list.stream()
+                        .map(worker -> ((JevWorkerState) worker).executionLocation())
+                        .toList().equals(List.of("LOCAL", "EXTERNAL", "UNKNOWN"))),
+                any(),
+                argThat(criteria -> criteria.get("worker_2").contains("executionLocation=EXTERNAL")));
+    }
+
+    @Test
+    void fallbackPrefersALocalWorkerOverALessLoadedExternalOne() {
+        WorkerCandidate busyLocal = candidateWithModel(1L, local("OLLAMA", "qwen3"), 5, 3);
+        WorkerCandidate idleExternal = candidateWithModel(2L, external("OPENAI", "gpt-4o"), 0, 0);
+        when(jevClient.chooseWorker(any(), any(), any())).thenThrow(new JevClientException("timeout"));
+
+        RoutingResponse response = service.route(externalAllowed(List.of(busyLocal, idleExternal)));
+
+        assertThat(response.workerId()).isEqualTo(1L);
+    }
+
+    @Test
     void neverOffersACandidateThatViolatesTheRequiredProviderToJev() {
         WorkerCandidate ollama = candidate(1L, "OLLAMA", 0, 0, 100, 10, 10);
         WorkerCandidate vllm = candidate(2L, "VLLM", 0, 0, 100, 10, 10);
@@ -145,8 +177,11 @@ class JevRoutingServiceTest {
         RoutingRequest request = routingRequest(privateData, List.of(externalOnly));
 
         assertThatThrownBy(() -> service.route(request))
-                .isInstanceOfSatisfying(ResponseStatusException.class,
-                        e -> assertThat(e.getStatusCode().value()).isEqualTo(422));
+                .isInstanceOfSatisfying(RoutingRejectedException.class, e -> {
+                    assertThat(e.getStatusCode().value()).isEqualTo(422);
+                    assertThat(e.getCode()).isEqualTo("PRIVATE_DATA_NO_LOCAL_WORKER");
+                    assertThat(e.nodeError().code()).isEqualTo("PRIVATE_DATA_NO_LOCAL_WORKER");
+                });
         verify(jevClient, never()).chooseWorker(any(), any(), any());
     }
 
@@ -180,13 +215,24 @@ class JevRoutingServiceTest {
     }
 
     private WorkerCandidate candidateWithModel(Long workerId, ModelInfo model) {
+        return candidateWithModel(workerId, model, 0, 0);
+    }
+
+    private WorkerCandidate candidateWithModel(Long workerId, ModelInfo model, int requestCount, int queueSize) {
         return new WorkerCandidate(workerId, "worker-" + workerId, null, List.of(model), "OLLAMA",
                 "SPRING_AI", "1.0.0",
-                0, 0, BigDecimal.ZERO, BigDecimal.ZERO, 0L,
+                requestCount, queueSize, BigDecimal.ZERO, BigDecimal.ZERO, 0L,
                 "cpu", BigDecimal.ZERO,
                 "memory", BigDecimal.ZERO,
                 "gpu", BigDecimal.ZERO,
                 "vram", BigDecimal.ZERO);
+    }
+
+    // Tests about non-LOCAL Workers need them to stay eligible: without a policy (AUTO) this
+    // Router keeps LOCAL-only Workers only - see JevDataRoutingPolicyTest.
+    private RoutingRequest externalAllowed(List<WorkerCandidate> workers) {
+        return new RoutingRequest(null, List.of(ChatMessage.user("hello")), null, null, List.of(), null, workers,
+                null, null, DataRoutingPolicy.EXTERNAL_ALLOWED);
     }
 
     private RoutingRequest routingRequest(RoutingHints hints, List<WorkerCandidate> workers) {

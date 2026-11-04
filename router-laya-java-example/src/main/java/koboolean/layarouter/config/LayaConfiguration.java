@@ -2,11 +2,19 @@ package koboolean.layarouter.config;
 
 import com.convaiinnovations.laya.Router;
 import koboolean.layarouter.laya.LayaTierClassifier;
+import koboolean.layarouter.policy.SensitivityChecker;
+import koboolean.layarouter.policy.SensitivityVerdict;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnMissingBean;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.core.io.Resource;
 
+import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 
@@ -21,7 +29,10 @@ public class LayaConfiguration {
     private static final Logger log = LoggerFactory.getLogger(LayaConfiguration.class);
 
     @Bean(destroyMethod = "close")
-    public LayaTierClassifier layaTierClassifier(LayaRouterProperties properties) {
+    public LayaTierClassifier layaTierClassifier(
+            LayaRouterProperties properties,
+            @Value("classpath:prompts/routing-system-prompt.st") Resource systemPromptResource
+    ) {
         Path checkpoints = requireDirectory(properties.getCheckpointsRoot(), "router.laya.checkpoints-root (LAYA_CHECKPOINTS)");
         Path graphs = requireDirectory(properties.getOnnxRoot(), "router.laya.onnx-root (LAYA_ONNX_ROOT)");
 
@@ -34,12 +45,33 @@ public class LayaConfiguration {
                 router.preload(properties.getPreload());
             }
             return router;
-        });
+        }, readResource(systemPromptResource));
 
         long started = System.nanoTime();
         classifier.warmUp();
         log.info("Laya warm-up completed in {} ms; Router is READY.", (System.nanoTime() - started) / 1_000_000);
         return classifier;
+    }
+
+    /**
+     * No sensitivity judge ships with this Router (Laya is not one - see {@link SensitivityChecker}),
+     * so DataRoutingPolicy AUTO fails closed to LOCAL-only Workers. Declare a
+     * {@link SensitivityChecker} bean to replace this.
+     */
+    @Bean
+    @ConditionalOnMissingBean
+    public SensitivityChecker sensitivityChecker() {
+        log.warn("No SensitivityChecker is configured: requests with DataRoutingPolicy AUTO (or none) are routed "
+                + "to LOCAL-only workers only.");
+        return request -> SensitivityVerdict.UNKNOWN;
+    }
+
+    private static String readResource(Resource resource) {
+        try {
+            return resource.getContentAsString(StandardCharsets.UTF_8);
+        } catch (IOException e) {
+            throw new UncheckedIOException("Failed to load Laya prompt: " + resource, e);
+        }
     }
 
     private static Path requireDirectory(Path path, String name) {

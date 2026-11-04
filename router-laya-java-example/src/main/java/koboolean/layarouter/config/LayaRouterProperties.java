@@ -29,6 +29,19 @@ public class LayaRouterProperties {
     /** How many checkpoints may be resident at once - a memory ceiling, not a cache hint. */
     private int maxLoaded = 2;
 
+    /**
+     * Unset: route to the tier Laya finds most probable. Set (0, 1]: route to the lowest tier
+     * whose cumulative probability reaches it, escalating ambiguous answers - see
+     * {@link koboolean.layarouter.laya.TierDecision#requiredTier(Double)}.
+     */
+    private Double confidenceThreshold;
+
+    /**
+     * Added to the Load Score of a Worker that is not LOCAL-only, as router-static-example's
+     * {@code router.static.external-penalty}.
+     */
+    private double externalPenalty = 0.1;
+
     private FallbackPolicy fallbackPolicy = FallbackPolicy.FALLBACK;
     /** Tier of a model that matches no rule, and of a Worker that reports no models. */
     private WorkerTier defaultTier = WorkerTier.SMALL;
@@ -139,6 +152,12 @@ public class LayaRouterProperties {
         if (maxLoaded < 1) {
             throw new IllegalStateException("router.laya.max-loaded must be at least 1 but was " + maxLoaded);
         }
+        if (confidenceThreshold != null && (confidenceThreshold <= 0.0 || confidenceThreshold > 1.0)) {
+            throw new IllegalStateException("router.laya.confidence-threshold must be in (0, 1] but was " + confidenceThreshold);
+        }
+        if (externalPenalty < 0.0 || externalPenalty > 1.0) {
+            throw new IllegalStateException("router.laya.external-penalty must be in [0, 1] but was " + externalPenalty);
+        }
         for (ModelCapabilityRule rule : modelCapabilities) {
             if (rule.getPattern() == null || rule.getPattern().isBlank() || rule.getTier() == null) {
                 throw new IllegalStateException("Every router.laya.model-capabilities entry needs a pattern and a tier.");
@@ -176,6 +195,22 @@ public class LayaRouterProperties {
 
     public void setMaxLoaded(int maxLoaded) {
         this.maxLoaded = maxLoaded;
+    }
+
+    public Double getConfidenceThreshold() {
+        return confidenceThreshold;
+    }
+
+    public void setConfidenceThreshold(Double confidenceThreshold) {
+        this.confidenceThreshold = confidenceThreshold;
+    }
+
+    public double getExternalPenalty() {
+        return externalPenalty;
+    }
+
+    public void setExternalPenalty(double externalPenalty) {
+        this.externalPenalty = externalPenalty;
     }
 
     public FallbackPolicy getFallbackPolicy() {

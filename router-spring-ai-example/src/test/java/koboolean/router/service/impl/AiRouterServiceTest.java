@@ -7,6 +7,7 @@ import com.inframesh.node.dto.router.RoutingRequest;
 import com.inframesh.node.dto.router.RoutingResponse;
 import com.inframesh.node.dto.router.WorkerCandidate;
 import com.inframesh.node.enums.ExecutionLocation;
+import koboolean.router.error.RoutingRejectedException;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
@@ -249,7 +250,7 @@ class AiRouterServiceTest {
     @Test
     void keepsAnExternalWorkerWhenPrivateDataIsFalse() {
         WorkerCandidate externalOnly = candidate(1L, "OLLAMA", external("OPENAI", "gpt-4o"));
-        respondWith("{\"workerId\": 1}");
+        respondWith("{\"workerId\": 1, \"sensitiveData\": false}");
 
         RoutingHints hints = new RoutingHints(null, null, List.of(), null, null, false);
         RoutingResponse response = service.route(routingRequest(hints, List.of(externalOnly)));
@@ -260,7 +261,7 @@ class AiRouterServiceTest {
     @Test
     void keepsAnExternalWorkerWhenPrivateDataIsNull() {
         WorkerCandidate externalOnly = candidate(1L, "OLLAMA", external("OPENAI", "gpt-4o"));
-        respondWith("{\"workerId\": 1}");
+        respondWith("{\"workerId\": 1, \"sensitiveData\": false}");
 
         RoutingHints hints = new RoutingHints(null, null, List.of(), null, null, null);
         RoutingResponse response = service.route(routingRequest(hints, List.of(externalOnly)));
@@ -271,11 +272,56 @@ class AiRouterServiceTest {
     @Test
     void keepsAnExternalWorkerWhenRoutingHintsAreAbsent() {
         WorkerCandidate externalOnly = candidate(1L, "OLLAMA", external("OPENAI", "gpt-4o"));
-        respondWith("{\"workerId\": 1}");
+        respondWith("{\"workerId\": 1, \"sensitiveData\": false}");
 
         RoutingResponse response = service.route(routingRequest(null, List.of(externalOnly)));
 
         assertThat(response.workerId()).isEqualTo(1L);
+    }
+
+    // --- sensitive data judged by the model ------------------------------------------
+
+    @Test
+    void acceptsALocalOnlyWorkerForARequestTheModelJudgesSensitive() {
+        WorkerCandidate localOnly = candidate(1L, "OLLAMA", local("OLLAMA", "qwen3"));
+        WorkerCandidate externalOnly = candidate(2L, "OLLAMA", external("OPENAI", "gpt-4o"));
+        respondWith("{\"workerId\": 1, \"sensitiveData\": true}");
+
+        RoutingResponse response = service.route(routingRequest(null, List.of(localOnly, externalOnly)));
+
+        assertThat(response.workerId()).isEqualTo(1L);
+    }
+
+    @Test
+    void rejectsWithBadGatewayWhenTheModelSendsSensitiveDataToAnExternalWorker() {
+        WorkerCandidate localOnly = candidate(1L, "OLLAMA", local("OLLAMA", "qwen3"));
+        WorkerCandidate externalOnly = candidate(2L, "OLLAMA", external("OPENAI", "gpt-4o"));
+        respondWith("{\"workerId\": 2, \"sensitiveData\": true}");
+
+        assertThatThrownBy(() -> service.route(routingRequest(null, List.of(localOnly, externalOnly))))
+                .isInstanceOfSatisfying(ResponseStatusException.class,
+                        e -> assertThat(e.getStatusCode().value()).isEqualTo(502));
+    }
+
+    @Test
+    void rejectsASensitiveRequestWhenNoWorkerIsLocalOnly() {
+        WorkerCandidate externalOnly = candidate(1L, "OLLAMA", external("OPENAI", "gpt-4o"));
+        respondWith("{\"workerId\": 1, \"sensitiveData\": true}");
+
+        assertThatThrownBy(() -> service.route(routingRequest(null, List.of(externalOnly))))
+                .isInstanceOfSatisfying(RoutingRejectedException.class, e -> {
+                    assertThat(e.getStatusCode().value()).isEqualTo(422);
+                    assertThat(e.nodeError().code()).isEqualTo("SENSITIVE_DATA_NO_LOCAL_WORKER");
+                });
+    }
+
+    @Test
+    void treatsAnAnswerWithoutTheSensitiveDataJudgementAsSensitive() {
+        WorkerCandidate externalOnly = candidate(1L, "OLLAMA", external("OPENAI", "gpt-4o"));
+        respondWith("{\"workerId\": 1}");
+
+        assertThatThrownBy(() -> service.route(routingRequest(null, List.of(externalOnly))))
+                .isInstanceOf(ResponseStatusException.class);
     }
 
     // --- privateData: failure -------------------------------------------------------
@@ -288,8 +334,11 @@ class AiRouterServiceTest {
         RoutingRequest request = routingRequest(privateData(), List.of(externalOnly, mixed));
 
         assertThatThrownBy(() -> service.route(request))
-                .isInstanceOfSatisfying(ResponseStatusException.class,
-                        e -> assertThat(e.getStatusCode().value()).isEqualTo(422));
+                .isInstanceOfSatisfying(RoutingRejectedException.class, e -> {
+                    assertThat(e.getStatusCode().value()).isEqualTo(422);
+                    assertThat(e.getCode()).isEqualTo("PRIVATE_DATA_NO_LOCAL_WORKER");
+                    assertThat(e.nodeError().code()).isEqualTo("PRIVATE_DATA_NO_LOCAL_WORKER");
+                });
         verify(chatModel, never()).call(any(Prompt.class));
     }
 

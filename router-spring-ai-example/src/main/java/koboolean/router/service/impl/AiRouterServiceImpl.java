@@ -7,6 +7,7 @@ import com.inframesh.node.dto.router.RoutingRequest;
 import com.inframesh.node.dto.router.RoutingResponse;
 import com.inframesh.node.dto.router.WorkerCandidate;
 import com.inframesh.node.enums.ExecutionLocation;
+import koboolean.router.error.RoutingRejectedException;
 import koboolean.router.service.RouterService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -57,6 +58,14 @@ import java.util.Map;
  * never from Console) and handed to a chat model, which returns the workerId it judges
  * best.
  * <p>
+ * The model also reports whether the request messages hold sensitive data (credentials,
+ * personal data, ...) - it already reads them to pick a Worker, so asking costs no extra call
+ * and sends the content nowhere new. A request it judges sensitive - or whose answer leaves the
+ * judgement out, fail-closed - is held to the same rule as {@code privateData}: the chosen Worker
+ * must be LOCAL-only. That is checked in code, not trusted: 422 with code
+ * {@code SENSITIVE_DATA_NO_LOCAL_WORKER} ({@link RoutingRejectedException}) when no eligible
+ * Worker is LOCAL-only, 502 when the model picked one that is not.
+ * <p>
  * The model's answer is never trusted blindly: it is accepted only if it names one of
  * the candidates that were actually offered. There is intentionally no automatic
  * fallback (e.g. to a least-loaded heuristic) when the model call fails, times out,
@@ -72,7 +81,7 @@ public class AiRouterServiceImpl implements RouterService {
 
     private static final HttpStatus UNPROCESSABLE_ENTITY = HttpStatus.valueOf(422);
     private static final HttpStatus BAD_GATEWAY = HttpStatus.valueOf(502);
-    private static final String NONE = "없음";
+    private static final String NONE = "none";
 
     private final ChatModel chatModel;
     private final JsonMapper jsonMapper = JsonMapper.builder().build();
@@ -116,14 +125,28 @@ public class AiRouterServiceImpl implements RouterService {
 //            return new RoutingResponse(eligible.get(0).workerId());
 //        }
 
-        Long selectedWorkerId = selectWithAi(request, eligible);
+        WorkerSelection selection = selectWithAi(request, eligible);
 
         WorkerCandidate selected = eligible.stream()
-                .filter(candidate -> candidate.workerId().equals(selectedWorkerId))
+                .filter(candidate -> candidate.workerId().equals(selection.workerId()))
                 .findFirst()
                 .orElseThrow(() -> new ResponseStatusException(BAD_GATEWAY,
                         "The routing model selected a workerId that was not among the offered candidates: "
-                                + selectedWorkerId));
+                                + selection.workerId()));
+
+        // Fail closed: an answer that leaves the judgement out counts as sensitive.
+        boolean sensitive = !Boolean.FALSE.equals(selection.sensitiveData());
+        if (sensitive && !isSafeForPrivateData(selected)) {
+            if (eligible.stream().noneMatch(this::isSafeForPrivateData)) {
+                throw new RoutingRejectedException(RoutingRejectedException.SENSITIVE_DATA_NO_LOCAL_WORKER,
+                        "The routing model judged the request to contain sensitive data but no worker candidate is LOCAL-only.");
+            }
+            throw new ResponseStatusException(BAD_GATEWAY,
+                    "The routing model judged the request to contain sensitive data but selected a worker that is not LOCAL-only: "
+                            + selected.workerId());
+        }
+        log.info("event=routing_decision sessionId={} selectedWorkerId={} sensitiveData={}",
+                request.sessionId(), selected.workerId(), sensitive);
 
         return new RoutingResponse(selected.workerId());
     }
@@ -180,7 +203,7 @@ public class AiRouterServiceImpl implements RouterService {
                 .toList();
 
         if (matched.isEmpty()) {
-            throw new ResponseStatusException(UNPROCESSABLE_ENTITY,
+            throw new RoutingRejectedException(RoutingRejectedException.PRIVATE_DATA_NO_LOCAL_WORKER,
                     "privateData routing hint is set but no worker candidate is LOCAL-only.");
         }
 
@@ -196,7 +219,7 @@ public class AiRouterServiceImpl implements RouterService {
         return models.stream().allMatch(model -> model.executionLocation() == ExecutionLocation.LOCAL);
     }
 
-    private Long selectWithAi(RoutingRequest request, List<WorkerCandidate> candidates) {
+    private WorkerSelection selectWithAi(RoutingRequest request, List<WorkerCandidate> candidates) {
         Prompt prompt = new Prompt(List.of(
                 new SystemMessage(systemPrompt),
                 new UserMessage(renderUserPrompt(request, candidates))
@@ -219,21 +242,21 @@ public class AiRouterServiceImpl implements RouterService {
             throw new ResponseStatusException(BAD_GATEWAY, "The routing model returned an empty response.");
         }
 
-        return parseWorkerId(text);
+        return parseSelection(text);
     }
 
-    private Long parseWorkerId(String text) {
+    private WorkerSelection parseSelection(String text) {
         try {
             WorkerSelection selection = jsonMapper.readValue(extractJsonObject(text), WorkerSelection.class);
             if (selection.workerId() == null) {
                 throw new ResponseStatusException(BAD_GATEWAY,
                         "The routing model response did not include a workerId: " + text);
             }
-            return selection.workerId();
+            return selection;
         } catch (ResponseStatusException e) {
             throw e;
         } catch (Exception e) {
-            log.warn("Could not parse routing model response as {{\"workerId\": <number>}}: {}", text);
+            log.warn("Could not parse routing model response as {{\"workerId\": <number>, \"sensitiveData\": <boolean>}}: {}", text);
             throw new ResponseStatusException(BAD_GATEWAY,
                     "Could not parse the routing model's response as JSON.", e);
         }
@@ -272,6 +295,7 @@ public class AiRouterServiceImpl implements RouterService {
         for (WorkerCandidate candidate : candidates) {
             builder.append("- workerId=").append(candidate.workerId())
                     .append(", name=").append(candidate.name())
+                    .append(", localOnly=").append(isSafeForPrivateData(candidate))
                     .append(", provider=").append(candidate.provider())
                     .append(", models=").append(candidate.models())
                     .append(", framework=").append(candidate.framework())
@@ -294,6 +318,6 @@ public class AiRouterServiceImpl implements RouterService {
         return builder.toString().stripTrailing();
     }
 
-    private record WorkerSelection(Long workerId) {
+    private record WorkerSelection(Long workerId, Boolean sensitiveData) {
     }
 }

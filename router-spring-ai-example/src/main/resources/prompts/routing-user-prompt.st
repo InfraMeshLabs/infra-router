@@ -1,9 +1,9 @@
-요청 메시지:
+Request messages:
 {messages}
 
-라우팅 힌트:
+Routing hints:
 - preferredModel: {preferredModel}
 - requiredProvider: {requiredProvider}
 
-후보 Worker 목록:
+Candidate Workers:
 {candidates}

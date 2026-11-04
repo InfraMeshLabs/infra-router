@@ -27,30 +27,33 @@ public class LayaTierClassifier implements AutoCloseable {
     public static final String WARM_UP_PROMPT = "Hello";
     public static final String QUESTION_KEY = "worker";
 
-    public static final Map<String, Question> QUESTIONS = questions();
-
     private static final HttpStatus BAD_GATEWAY = HttpStatus.BAD_GATEWAY;
 
     private final Supplier<? extends Predictor> engineFactory;
+    private final Map<String, Question> questions;
     private final ReentrantLock predictLock = new ReentrantLock();
 
     private volatile Predictor engine;
     private volatile boolean ready;
 
-    public LayaTierClassifier(Supplier<? extends Predictor> engineFactory) {
+    /**
+     * @param systemPrompt the question Laya answers - {@code prompts/routing-system-prompt.st}
+     */
+    public LayaTierClassifier(Supplier<? extends Predictor> engineFactory, String systemPrompt) {
         this.engineFactory = engineFactory;
+        this.questions = questions(systemPrompt.strip());
     }
 
     // Options are positional in Laya, so the criteria must keep their order: a LinkedHashMap,
     // never Map.of (which laya-java refuses rather than silently reorders).
-    private static Map<String, Question> questions() {
+    private static Map<String, Question> questions(String systemPrompt) {
         Map<String, String> criteria = new LinkedHashMap<>();
         criteria.put(WorkerTier.SMALL.label(), "Simple questions, short conversations, basic tasks");
         criteria.put(WorkerTier.MEDIUM.label(), "Moderate reasoning, coding, or analysis");
         criteria.put(WorkerTier.POWERFUL.label(), "Complex reasoning, architecture, difficult coding tasks");
 
         Map<String, Question> questions = new LinkedHashMap<>();
-        questions.put(QUESTION_KEY, Question.choice("Which worker class is most appropriate for this request?", criteria));
+        questions.put(QUESTION_KEY, Question.choice(systemPrompt, criteria));
         return Collections.unmodifiableMap(questions);
     }
 
@@ -96,7 +99,7 @@ public class LayaTierClassifier implements AutoCloseable {
     private Prediction predict(String prompt) {
         predictLock.lock();
         try {
-            return engine.predict(prompt, QUESTIONS);
+            return engine.predict(prompt, questions);
         } finally {
             predictLock.unlock();
         }
