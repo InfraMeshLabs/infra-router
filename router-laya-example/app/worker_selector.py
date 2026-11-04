@@ -7,11 +7,13 @@ from fnmatch import fnmatchcase
 from typing import Optional
 
 from app.config import FallbackPolicy, ModelCapabilityRule, ScoreWeights, Settings
-from app.models import PRIVATE_DATA_NO_LOCAL_WORKER, RoutingError, RoutingHints, WorkerCandidate, WorkerTier
+from app.data_routing import PRIVATE_DATA_REQUIREMENT, LocalOnlyRequirement
+from app.models import RoutingError, RoutingHints, WorkerCandidate, WorkerTier
 
 log = logging.getLogger(__name__)
 
 UNPROCESSABLE_ENTITY = 422
+INTERNAL_SERVER_ERROR = 500
 LOCAL = "LOCAL"
 
 
@@ -44,7 +46,9 @@ class WorkerSelector:
 
     RoutingHints are enforced exactly like the other Router examples: ``requiredProvider``,
     ``gpuRequired`` and ``privateData`` are hard filters (422 when nothing is left) and
-    ``preferredModel`` is a soft preference.
+    ``preferredModel`` is a soft preference. A LocalOnlyRequirement (privateData or the Team's
+    DataRoutingPolicy - see ``app.data_routing``) is the LOCAL-only hard filter, applied before
+    the soft preference and the tier fallback, so neither can bring back a Worker it removed.
 
     For the tier Laya asked for, the Workers of the closest tier that is at least as
     capable are used (a SMALL request does not occupy a POWERFUL Worker while a SMALL one
@@ -62,12 +66,17 @@ class WorkerSelector:
     # --- RoutingHints filtering -----------------------------------------------------
 
     def filter_by_hints(
-        self, candidates: Optional[list[WorkerCandidate]], hints: Optional[RoutingHints]
+        self,
+        candidates: Optional[list[WorkerCandidate]],
+        hints: Optional[RoutingHints],
+        local_only: Optional[LocalOnlyRequirement] = None,
     ) -> list[WorkerCandidate]:
         if not candidates:
             raise RoutingError(UNPROCESSABLE_ENTITY, "No worker candidates were provided for routing.")
-        if hints is None:
-            return candidates
+        # privateData restricts on its own even when no requirement is passed in.
+        if local_only is None and hints is not None and hints.private_data is True:
+            local_only = PRIVATE_DATA_REQUIREMENT
+        hints = hints or RoutingHints()
 
         eligible = candidates
 
@@ -88,14 +97,10 @@ class WorkerSelector:
                     "gpuRequired routing hint is set but no worker candidate reports a GPU.",
                 )
 
-        if hints.private_data is True:
-            eligible = [c for c in eligible if self._is_safe_for_private_data(c)]
+        if local_only is not None:
+            eligible = [c for c in eligible if self._is_local_only(c)]
             if not eligible:
-                raise RoutingError(
-                    UNPROCESSABLE_ENTITY,
-                    "privateData routing hint is set but no worker candidate is LOCAL-only.",
-                    code=PRIVATE_DATA_NO_LOCAL_WORKER,
-                )
+                raise RoutingError(UNPROCESSABLE_ENTITY, local_only.reason, code=local_only.code)
 
         if hints.preferred_model and hints.preferred_model.strip():
             preferred = hints.preferred_model.lower()
@@ -106,8 +111,17 @@ class WorkerSelector:
 
         return eligible
 
+    def verify_selection(self, selected: WorkerCandidate, local_only: Optional[LocalOnlyRequirement]) -> None:
+        """Last check on the Worker actually selected. Failing it is a Router bug, never a
+        reason to send data out."""
+        if local_only is not None and not self._is_local_only(selected):
+            raise RoutingError(
+                INTERNAL_SERVER_ERROR,
+                f"Selected worker {selected.worker_id} is not LOCAL-only but the request requires it.",
+            )
+
     @staticmethod
-    def _is_safe_for_private_data(candidate: WorkerCandidate) -> bool:
+    def _is_local_only(candidate: WorkerCandidate) -> bool:
         # Fail closed: no models, or any model that is not known to be LOCAL, is unsafe.
         models = candidate.models or []
         return bool(models) and all(model.execution_location == LOCAL for model in models)
@@ -179,7 +193,7 @@ class WorkerSelector:
         load_score = weighted_sum / available_weight if available_weight > 0 else UNKNOWN_LOAD_SCORE
         # A Worker that may send the request data to an external AI provider wins only when it
         # is clearly less loaded - same rule as router-static-example's external-penalty.
-        return load_score if self._is_safe_for_private_data(candidate) else load_score + self._external_penalty
+        return load_score if self._is_local_only(candidate) else load_score + self._external_penalty
 
 
 # Usage of whatever the Worker runs inference on - same rule as router-static-example: its

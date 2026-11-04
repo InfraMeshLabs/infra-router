@@ -1,12 +1,13 @@
 """InfraMesh Router HTTP contract as Pydantic models.
 
-These mirror the JSON shape of the ``infra-node`` 0.1.1 DTOs
-(``com.inframesh.node.dto.*``) field for field. ``infra-node`` stays the source of
+These mirror the JSON shape of the ``infra-node`` DTOs (``com.inframesh.node.dto.*``) this
+Router reads - 0.1.1, plus ``RoutingRequest.dataRoutingPolicy`` from 0.1.6. ``infra-node`` stays the source of
 truth: when a DTO changes there, change it here.
 
 Mirrored Jackson behaviour:
 - property names are the Java record component names (camelCase);
-- enums travel as their names, kept here as plain strings;
+- enums travel as their names, kept here as plain strings - except DataRoutingPolicy, which
+  this Router acts on, so an unknown value is rejected (400) instead of silently ignored;
 - unknown properties are ignored, so a newer Console does not break this Router;
 - every component is nullable, except that the collections the Java records normalize
   in their compact constructors (``null`` -> empty list) are normalized here too.
@@ -54,6 +55,21 @@ class RoutingError(Exception):
 # privateData is set but no eligible Worker is LOCAL-only - the same refusal code the Java Routers
 # send. The message never contains the request content.
 PRIVATE_DATA_NO_LOCAL_WORKER = "PRIVATE_DATA_NO_LOCAL_WORKER"
+# DataRoutingPolicy INTERNAL_ONLY, and no eligible Worker is LOCAL-only.
+INTERNAL_ONLY_NO_LOCAL_WORKER = "INTERNAL_ONLY_NO_LOCAL_WORKER"
+# AUTO judged the request sensitive, and no eligible Worker is LOCAL-only.
+SENSITIVE_DATA_NO_LOCAL_WORKER = "SENSITIVE_DATA_NO_LOCAL_WORKER"
+# AUTO could not judge the request not sensitive (no judge configured, a failure, an uncertain
+# result), and no eligible Worker is LOCAL-only.
+SENSITIVITY_UNVERIFIED_NO_LOCAL_WORKER = "SENSITIVITY_UNVERIFIED_NO_LOCAL_WORKER"
+
+
+class DataRoutingPolicy(str, Enum):
+    """com.inframesh.node.enums.DataRoutingPolicy - the Team's rule, set in Console."""
+
+    AUTO = "AUTO"
+    INTERNAL_ONLY = "INTERNAL_ONLY"
+    EXTERNAL_ALLOWED = "EXTERNAL_ALLOWED"
 
 
 class _Contract(BaseModel):
@@ -164,6 +180,8 @@ class RoutingRequest(_Contract):
     tools: Annotated[list[ToolDefinition], _NullAsEmpty] = []
     tool_choice: Optional[ToolChoice] = None
     workers: Annotated[list[WorkerCandidate], _NullAsEmpty] = []
+    # From Console's Team settings, never client input. Missing / null means AUTO.
+    data_routing_policy: Optional[DataRoutingPolicy] = None
 
 
 class RoutingResponse(_Contract):

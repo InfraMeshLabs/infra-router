@@ -31,9 +31,11 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from app.config import Settings
+from app.data_routing import DataRoutingGuard, SensitivityChecker, not_configured, policy_of
 from app.laya_router import LayaRouter
 from app.models import (
     CpuInfo,
+    DataRoutingPolicy,
     GpuInfo,
     MemoryInfo,
     NodeHealthResponse,
@@ -53,7 +55,11 @@ API_PATH_PREFIX = "/api/v1"
 MIB_TO_BYTES = 1024 * 1024
 
 
-def create_app(settings: Optional[Settings] = None, laya_router: Optional[LayaRouter] = None) -> FastAPI:
+def create_app(
+    settings: Optional[Settings] = None,
+    laya_router: Optional[LayaRouter] = None,
+    sensitivity_checker: Optional[SensitivityChecker] = None,
+) -> FastAPI:
     logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO").upper(), format="%(asctime)s %(levelname)s %(name)s %(message)s")
 
     settings = settings or Settings.load()
@@ -61,11 +67,15 @@ def create_app(settings: Optional[Settings] = None, laya_router: Optional[LayaRo
     laya = laya_router or LayaRouter()
     prompt_builder = PromptBuilder()
     worker_selector = WorkerSelector(settings)
+    data_routing_guard = DataRoutingGuard(sensitivity_checker or not_configured)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
         if not settings.security_enabled:
             log.warning("security.enabled is false: %s requests are NOT authenticated.", API_PATH_PREFIX)
+        if sensitivity_checker is None:
+            log.warning("No sensitivity checker is configured: requests with DataRoutingPolicy AUTO (or none) "
+                        "are routed to LOCAL-only workers only.")
 
         # Load (and on first run download) the Laya checkpoint before serving, so the
         # first real routing request does not pay the model-loading cost. The server
@@ -97,7 +107,12 @@ def create_app(settings: Optional[Settings] = None, laya_router: Optional[LayaRo
         return _error_response(request, error.status, error.message, error.code)
 
     @app.exception_handler(RequestValidationError)
-    async def validation_error_handler(request: Request, _: RequestValidationError):
+    async def validation_error_handler(request: Request, error: RequestValidationError):
+        # The validator's own message is not echoed: it may quote the request content.
+        if any("dataRoutingPolicy" in err.get("loc", ()) for err in error.errors()):
+            allowed = ", ".join(policy.value for policy in DataRoutingPolicy)
+            return _error_response(request, HTTPStatus.BAD_REQUEST,
+                                   f"Malformed RoutingRequest: dataRoutingPolicy must be one of [{allowed}].")
         return _error_response(request, HTTPStatus.BAD_REQUEST, "Malformed RoutingRequest.")
 
     # --- API ----------------------------------------------------------------------------
@@ -119,7 +134,8 @@ def create_app(settings: Optional[Settings] = None, laya_router: Optional[LayaRo
         total_started = time.perf_counter()
 
         selection_started = time.perf_counter()
-        eligible = worker_selector.filter_by_hints(request.workers, request.routing)
+        local_only = data_routing_guard.local_only_requirement(request)
+        eligible = worker_selector.filter_by_hints(request.workers, request.routing, local_only)
         selection_ms = _elapsed_ms(selection_started)
 
         prompt = prompt_builder.build(request)
@@ -134,12 +150,15 @@ def create_app(settings: Optional[Settings] = None, laya_router: Optional[LayaRo
 
         selection_started = time.perf_counter()
         selected = worker_selector.select(required_tier, eligible)
+        worker_selector.verify_selection(selected, local_only)
         selection_ms += _elapsed_ms(selection_started)
 
         # The user's prompt is never logged.
         fields = {
             "event": "routing_decision",
             "sessionId": request.session_id,
+            "dataRoutingPolicy": policy_of(request).value,
+            "localOnly": local_only.code if local_only else "none",
             "layaTier": decision.tier.value,
             "requiredTier": required_tier.value,
             "candidateWorkerCount": len(request.workers or []),

@@ -1,6 +1,7 @@
 import pytest
 
 from app.config import FallbackPolicy, ModelCapabilityRule, Settings
+from app.data_routing import LocalOnlyRequirement
 from app.models import ModelInfo, RoutingError, RoutingHints, WorkerCandidate, WorkerTier
 from app.worker_selector import WorkerSelector
 
@@ -213,3 +214,14 @@ def test_preferred_model_is_a_soft_preference():
 
     assert [c.worker_id for c in narrowed] == [2]
     assert [c.worker_id for c in unmatched] == [1, 2]
+
+
+def test_verify_selection_rejects_a_worker_that_breaks_the_local_only_requirement():
+    requirement = LocalOnlyRequirement("INTERNAL_ONLY_NO_LOCAL_WORKER", "r")
+    external = candidate(1, location="EXTERNAL")
+
+    with pytest.raises(RoutingError) as error:
+        selector().verify_selection(external, requirement)
+
+    assert error.value.status == 500
+    selector().verify_selection(external, None)

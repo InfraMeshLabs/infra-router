@@ -6,6 +6,8 @@ import koboolean.layarouter.laya.LayaTierClassifier;
 import koboolean.layarouter.laya.TierDecision;
 import koboolean.layarouter.laya.WorkerTier;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.server.LocalServerPort;
@@ -95,6 +97,61 @@ class RouterHttpContractTest {
         assertThat(json.get("code").asString()).isEqualTo("PRIVATE_DATA_NO_LOCAL_WORKER");
         assertThat(json.get("status").asInt()).isEqualTo(422);
         assertThat(json.get("path").asString()).isEqualTo("/api/v1/route");
+        verify(classifier, never()).classify(any());
+    }
+
+    @Test
+    void refusesAnInternalOnlyRequestWithNoLocalWorkerWithAMachineReadableCode() throws Exception {
+        String externalOnly = WORKERS.replace("\"LOCAL\"", "\"EXTERNAL\"");
+        String body = routingRequest(externalOnly).replace("\"routing\": null",
+                "\"routing\": null, \"dataRoutingPolicy\": \"INTERNAL_ONLY\"");
+
+        HttpResponse<String> response = post(body, apiKey);
+
+        assertThat(response.statusCode()).isEqualTo(422);
+        assertThat(JsonMapper.shared().readTree(response.body()).get("code").asString())
+                .isEqualTo("INTERNAL_ONLY_NO_LOCAL_WORKER");
+        verify(classifier, never()).classify(any());
+    }
+
+    // No SensitivityChecker ships with this Router, so AUTO - also a request without the field,
+    // from an older Console - keeps the request on LOCAL-only Workers.
+    @Test
+    void aRequestWithoutDataRoutingPolicyIsAutoAndFailsClosed() throws Exception {
+        String externalOnly = WORKERS.replace("\"LOCAL\"", "\"EXTERNAL\"");
+
+        HttpResponse<String> response = post(routingRequest(externalOnly), apiKey);
+
+        assertThat(response.statusCode()).isEqualTo(422);
+        assertThat(JsonMapper.shared().readTree(response.body()).get("code").asString())
+                .isEqualTo("SENSITIVITY_UNVERIFIED_NO_LOCAL_WORKER");
+    }
+
+    @Test
+    void externalAllowedMayUseExternalWorkers() throws Exception {
+        when(classifier.classify(contains("hello"))).thenReturn(new TierDecision(WorkerTier.MEDIUM, Map.of()));
+        String externalOnly = WORKERS.replace("\"LOCAL\"", "\"EXTERNAL\"");
+        String body = routingRequest(externalOnly).replace("\"routing\": null",
+                "\"routing\": null, \"dataRoutingPolicy\": \"EXTERNAL_ALLOWED\"");
+
+        HttpResponse<String> response = post(body, apiKey);
+
+        assertThat(response.statusCode()).isEqualTo(200);
+        assertThat(JsonMapper.shared().readTree(response.body()).get("workerId").asLong()).isEqualTo(2L);
+    }
+
+    // Case-sensitive, as in the Python example.
+    @ParameterizedTest
+    @ValueSource(strings = {"SOMETIMES", "auto"})
+    void rejectsAnUnknownDataRoutingPolicyAsBadRequest(String policy) throws Exception {
+        String body = routingRequest(WORKERS).replace("\"routing\": null",
+                "\"routing\": null, \"dataRoutingPolicy\": \"" + policy + "\"");
+
+        HttpResponse<String> response = post(body, apiKey);
+
+        assertThat(response.statusCode()).isEqualTo(400);
+        assertThat(JsonMapper.shared().readTree(response.body()).get("message").asString())
+                .isEqualTo("Malformed RoutingRequest: dataRoutingPolicy must be one of [AUTO, INTERNAL_ONLY, EXTERNAL_ALLOWED].");
         verify(classifier, never()).classify(any());
     }
 

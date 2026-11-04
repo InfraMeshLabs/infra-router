@@ -6,6 +6,7 @@ import com.inframesh.node.dto.router.RoutingHints;
 import com.inframesh.node.dto.router.RoutingRequest;
 import com.inframesh.node.dto.router.RoutingResponse;
 import com.inframesh.node.dto.router.WorkerCandidate;
+import com.inframesh.node.enums.DataRoutingPolicy;
 import com.inframesh.node.enums.ExecutionLocation;
 import koboolean.jevrouter.client.JevClient;
 import koboolean.jevrouter.client.JevClientException;
@@ -101,7 +102,7 @@ class JevRoutingServiceTest {
         WorkerCandidate unknown = candidateWithModel(3L, new ModelInfo("OLLAMA", "qwen3", null));
         respondWith("worker_1", 0.9);
 
-        service.route(routingRequest(null, List.of(localOnly, externalOnly, unknown)));
+        service.route(externalAllowed(List.of(localOnly, externalOnly, unknown)));
 
         verify(jevClient).chooseWorker(
                 argThat(state -> state instanceof List<?> list && list.stream()
@@ -117,7 +118,7 @@ class JevRoutingServiceTest {
         WorkerCandidate idleExternal = candidateWithModel(2L, external("OPENAI", "gpt-4o"), 0, 0);
         when(jevClient.chooseWorker(any(), any(), any())).thenThrow(new JevClientException("timeout"));
 
-        RoutingResponse response = service.route(routingRequest(null, List.of(busyLocal, idleExternal)));
+        RoutingResponse response = service.route(externalAllowed(List.of(busyLocal, idleExternal)));
 
         assertThat(response.workerId()).isEqualTo(1L);
     }
@@ -225,6 +226,13 @@ class JevRoutingServiceTest {
                 "memory", BigDecimal.ZERO,
                 "gpu", BigDecimal.ZERO,
                 "vram", BigDecimal.ZERO);
+    }
+
+    // Tests about non-LOCAL Workers need them to stay eligible: without a policy (AUTO) this
+    // Router keeps LOCAL-only Workers only - see JevDataRoutingPolicyTest.
+    private RoutingRequest externalAllowed(List<WorkerCandidate> workers) {
+        return new RoutingRequest(null, List.of(ChatMessage.user("hello")), null, null, List.of(), null, workers,
+                null, null, DataRoutingPolicy.EXTERNAL_ALLOWED);
     }
 
     private RoutingRequest routingRequest(RoutingHints hints, List<WorkerCandidate> workers) {

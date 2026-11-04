@@ -21,6 +21,13 @@ public class RoutingRejectedException extends ResponseStatusException implements
     public static final String PRIVATE_DATA_NO_LOCAL_WORKER = "PRIVATE_DATA_NO_LOCAL_WORKER";
     /** The request was judged to hold sensitive data but no eligible Worker is LOCAL-only. */
     public static final String SENSITIVE_DATA_NO_LOCAL_WORKER = "SENSITIVE_DATA_NO_LOCAL_WORKER";
+    /** {@code dataRoutingPolicy} is INTERNAL_ONLY but no eligible Worker is LOCAL-only. */
+    public static final String INTERNAL_ONLY_NO_LOCAL_WORKER = "INTERNAL_ONLY_NO_LOCAL_WORKER";
+    /**
+     * {@code dataRoutingPolicy} is AUTO (or missing), this Router has no sensitivity judge, and no
+     * eligible Worker is LOCAL-only.
+     */
+    public static final String SENSITIVITY_UNVERIFIED_NO_LOCAL_WORKER = "SENSITIVITY_UNVERIFIED_NO_LOCAL_WORKER";
 
     private final String code;
 

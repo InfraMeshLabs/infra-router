@@ -10,6 +10,7 @@ import koboolean.layarouter.config.LayaRouterProperties.Weights;
 import koboolean.layarouter.config.LayaRouterProperties;
 import koboolean.layarouter.error.RoutingRejectedException;
 import koboolean.layarouter.laya.WorkerTier;
+import koboolean.layarouter.policy.LocalOnlyRequirement;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpStatus;
@@ -25,6 +26,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.function.Function;
 import java.util.regex.Pattern;
 
@@ -34,7 +36,9 @@ import java.util.regex.Pattern;
  * <p>
  * RoutingHints are enforced exactly like the other Router examples: {@code requiredProvider},
  * {@code gpuRequired} and {@code privateData} are hard filters (422 when nothing is left) and
- * {@code preferredModel} is a soft preference.
+ * {@code preferredModel} is a soft preference. A {@link LocalOnlyRequirement} (privateData or the
+ * Team's DataRoutingPolicy - see {@code DataRoutingGuard}) is the LOCAL-only hard filter, applied
+ * before the soft preference and the tier fallback, so neither can bring back a Worker it removed.
  * <p>
  * For the tier Laya asked for, the Workers of the closest tier that is at least as capable are
  * used (a SMALL request does not occupy a POWERFUL Worker while a SMALL one exists). When no
@@ -68,18 +72,25 @@ public class WorkerSelector {
 
     // --- RoutingHints filtering (mirrors the other Router examples' hard-constraint policy) --
 
+    /** privateData is the only LOCAL-only requirement - DataRoutingPolicy EXTERNAL_ALLOWED. */
     public List<WorkerCandidate> filterByHints(List<WorkerCandidate> candidates, RoutingHints hints) {
+        Optional<LocalOnlyRequirement> localOnly = hints != null && hints.isPrivateData()
+                ? Optional.of(new LocalOnlyRequirement(RoutingRejectedException.PRIVATE_DATA_NO_LOCAL_WORKER,
+                        "privateData routing hint is set but no worker candidate is LOCAL-only."))
+                : Optional.empty();
+        return filterByHints(candidates, hints, localOnly);
+    }
+
+    public List<WorkerCandidate> filterByHints(List<WorkerCandidate> candidates, RoutingHints hints,
+                                               Optional<LocalOnlyRequirement> localOnly) {
         if (candidates == null || candidates.isEmpty()) {
             throw new ResponseStatusException(UNPROCESSABLE_ENTITY,
                     "No worker candidates were provided for routing.");
         }
-        if (hints == null) {
-            return candidates;
-        }
 
         List<WorkerCandidate> eligible = candidates;
 
-        if (hints.requiredProvider() != null && !hints.requiredProvider().isBlank()) {
+        if (hints != null && hints.requiredProvider() != null && !hints.requiredProvider().isBlank()) {
             eligible = eligible.stream()
                     .filter(candidate -> hints.requiredProvider().equalsIgnoreCase(candidate.provider()))
                     .toList();
@@ -89,7 +100,7 @@ public class WorkerSelector {
             }
         }
 
-        if (Boolean.TRUE.equals(hints.gpuRequired())) {
+        if (hints != null && Boolean.TRUE.equals(hints.gpuRequired())) {
             eligible = eligible.stream()
                     .filter(candidate -> candidate.gpu() != null && !candidate.gpu().isBlank())
                     .toList();
@@ -99,17 +110,16 @@ public class WorkerSelector {
             }
         }
 
-        if (hints.isPrivateData()) {
-            eligible = eligible.stream().filter(this::isSafeForPrivateData).toList();
+        if (localOnly.isPresent()) {
+            eligible = eligible.stream().filter(this::isLocalOnly).toList();
             if (eligible.isEmpty()) {
-                throw new RoutingRejectedException(RoutingRejectedException.PRIVATE_DATA_NO_LOCAL_WORKER,
-                        "privateData routing hint is set but no worker candidate is LOCAL-only.");
+                throw new RoutingRejectedException(localOnly.get().code(), localOnly.get().reason());
             }
         }
 
         // preferredModel is a soft preference: it narrows the candidate set only if doing so
         // would not eliminate every remaining candidate.
-        if (hints.preferredModel() != null && !hints.preferredModel().isBlank()) {
+        if (hints != null && hints.preferredModel() != null && !hints.preferredModel().isBlank()) {
             List<WorkerCandidate> matched = eligible.stream()
                     .filter(candidate -> modelsOf(candidate).stream()
                             .anyMatch(model -> hints.preferredModel().equalsIgnoreCase(model.modelName())))
@@ -120,8 +130,19 @@ public class WorkerSelector {
         return eligible;
     }
 
+    /**
+     * Last check on the Worker actually selected: it must satisfy the LOCAL-only requirement the
+     * candidates were filtered by. Failing it is a Router bug, never a reason to send data out.
+     */
+    public void verifySelection(WorkerCandidate selected, Optional<LocalOnlyRequirement> localOnly) {
+        if (localOnly.isPresent() && !isLocalOnly(selected)) {
+            throw new ResponseStatusException(HttpStatus.INTERNAL_SERVER_ERROR,
+                    "Selected worker " + selected.workerId() + " is not LOCAL-only but the request requires it.");
+        }
+    }
+
     // Fail closed: no models, or any model that is not known to be LOCAL, is unsafe.
-    private boolean isSafeForPrivateData(WorkerCandidate candidate) {
+    private boolean isLocalOnly(WorkerCandidate candidate) {
         List<ModelInfo> models = modelsOf(candidate);
         return !models.isEmpty() && models.stream().allMatch(model -> model.executionLocation() == ExecutionLocation.LOCAL);
     }
@@ -215,7 +236,7 @@ public class WorkerSelector {
         double loadScore = availableWeight > 0 ? weightedSum / availableWeight : UNKNOWN_LOAD_SCORE;
         // A Worker that may send the request data to an external AI provider wins only when it is
         // clearly less loaded - same rule as router-static-example's external-penalty.
-        return isSafeForPrivateData(candidate) ? loadScore : loadScore + externalPenalty;
+        return isLocalOnly(candidate) ? loadScore : loadScore + externalPenalty;
     }
 
     // Usage of whatever the Worker runs inference on - same rule as router-static-example: its GPU

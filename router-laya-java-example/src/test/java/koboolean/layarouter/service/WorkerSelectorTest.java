@@ -9,6 +9,7 @@ import koboolean.layarouter.config.LayaRouterProperties.ModelCapabilityRule;
 import koboolean.layarouter.config.LayaRouterProperties;
 import koboolean.layarouter.error.RoutingRejectedException;
 import koboolean.layarouter.laya.WorkerTier;
+import koboolean.layarouter.policy.LocalOnlyRequirement;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
@@ -16,6 +17,7 @@ import org.springframework.web.server.ResponseStatusException;
 
 import java.math.BigDecimal;
 import java.util.List;
+import java.util.Optional;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -258,6 +260,19 @@ class WorkerSelectorTest {
                     assertThat(e.getStatusCode().value()).isEqualTo(422);
                     assertThat(e.nodeError().code()).isEqualTo("PRIVATE_DATA_NO_LOCAL_WORKER");
                 });
+    }
+
+    @Test
+    void verifySelectionRejectsAWorkerThatBreaksTheLocalOnlyRequirement() {
+        WorkerCandidate external = new WorkerCandidate(1L, "w", null,
+                List.of(new ModelInfo("OPENAI", "gpt-4o", ExecutionLocation.EXTERNAL)), "OPENAI", null, null,
+                null, null, null, null, null, null, null, null, null, null, null, null, null);
+        Optional<LocalOnlyRequirement> localOnly = Optional.of(new LocalOnlyRequirement("INTERNAL_ONLY_NO_LOCAL_WORKER", "r"));
+
+        assertThatThrownBy(() -> selector().verifySelection(external, localOnly))
+                .isInstanceOfSatisfying(ResponseStatusException.class,
+                        e -> assertThat(e.getStatusCode().value()).isEqualTo(500));
+        selector().verifySelection(external, Optional.empty());
     }
 
     @Test

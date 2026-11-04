@@ -24,6 +24,7 @@ InfraMesh Console
         ▼
 router-laya-example  (FastAPI)
         │
+        ├── DataRoutingGuard privateData + dataRoutingPolicy → LOCAL-only or not
         ├── WorkerSelector   RoutingHints hard filters / soft preference
         ├── PromptBuilder    RoutingRequest.messages → Laya input text
         ├── LayaRouter       Laya Choice → WorkerTier (small / medium / powerful)
@@ -56,16 +57,27 @@ Laya does **not** judge whether the request content is sensitive. That was tried
 Laya classifies what a text is *about*, not whether it holds an actual secret value, so it
 flagged ordinary questions that merely mention passwords and missed a message carrying a real
 national ID and phone number. Sensitive data is kept off external providers by the
-`privateData` hint (a hard filter, `422 PRIVATE_DATA_NO_LOCAL_WORKER` when no LOCAL-only Worker
-is left) - see "Sensitive data detection" in the root README for the measurements. Among the
-eligible Workers, one that is not LOCAL-only gets `external-penalty` (default `0.1`) added to
-its Load Score, as in `router-static-example`.
+`privateData` hint and the data routing policy below - see "Sensitive data detection" in the
+root README for the measurements. Among the eligible Workers, one that is not LOCAL-only gets
+`external-penalty` (default `0.1`) added to its Load Score, as in `router-static-example`.
+
+**Data routing policy.** Console sends the Team's `dataRoutingPolicy` (`AUTO` /
+`INTERNAL_ONLY` / `EXTERNAL_ALLOWED`, missing = `AUTO`). `privateData` and `INTERNAL_ONLY`
+restrict the candidates to LOCAL-only Workers; `EXTERNAL_ALLOWED` does not; `AUTO` restricts
+them unless a sensitivity checker judged the request not sensitive. This Router ships no checker
+(pass one to `create_app(sensitivity_checker=...)`; it must run locally), so **AUTO - and a
+request without the field - currently behaves like INTERNAL_ONLY**, and a checker failure or an
+uncertain verdict does too. There is no fallback to an external Worker: no LOCAL-only Worker
+left → `422` with `PRIVATE_DATA_NO_LOCAL_WORKER`, `INTERNAL_ONLY_NO_LOCAL_WORKER`,
+`SENSITIVE_DATA_NO_LOCAL_WORKER` or `SENSITIVITY_UNVERIFIED_NO_LOCAL_WORKER`. Laya's tier and the
+selection below are unchanged; they run on what is left. Policy code: `app/data_routing.py`. See
+"Data routing policy" in the root README.
 
 ### Worker selection
 
 1. **RoutingHints**, same policy as the other examples: `requiredProvider`, `gpuRequired`
-   and `privateData` are hard filters (`422` when no candidate remains); `preferredModel`
-   is a soft preference.
+   and the LOCAL-only requirement (`privateData` / `dataRoutingPolicy`) are hard filters
+   (`422` when no candidate remains); `preferredModel` is a soft preference.
 2. **Capability tier.** Each model name is mapped to a tier by the explicit entries in
    `application.yml` (no model name is hardcoded); a Worker's tier is the highest tier among
    its models. `powerful > medium > small`, and a more capable Worker can serve a lower
@@ -211,12 +223,14 @@ wildcards (for example `my-finetune-*`) when you have assessed a whole model fam
 
 Identical to the Java Router examples. The Pydantic models in `app/models.py` mirror the
 `infra-node` **`0.1.1`** DTOs (`io.github.inframeshai:inframesh-node:0.1.1`) field for
-field; `infra-node` remains the source of truth. This service has no dependency on the Java
+field, plus `RoutingRequest.dataRoutingPolicy` from `0.1.6`; `infra-node` remains the source of
+truth. This service has no dependency on the Java
 artifact — when the contract version changes, `app/models.py` has to be updated by hand.
 
 A refusal for a policy reason adds a `code` to the error body, the same code the Java Routers
-send: `PRIVATE_DATA_NO_LOCAL_WORKER` (`privateData` set, no LOCAL-only Worker). See "Error codes
-for refused requests" in the root README.
+send: `PRIVATE_DATA_NO_LOCAL_WORKER`, `INTERNAL_ONLY_NO_LOCAL_WORKER`,
+`SENSITIVE_DATA_NO_LOCAL_WORKER`, `SENSITIVITY_UNVERIFIED_NO_LOCAL_WORKER` (no LOCAL-only Worker
+for the reason the code names). See "Error codes for refused requests" in the root README.
 
 Laya-specific data (tier, probabilities, scores) is internal and never appears in a request
 or response.
@@ -248,9 +262,9 @@ Errors:
 
 | Status | When |
 |---|---|
-| `400` | Malformed `RoutingRequest`. |
+| `400` | Malformed `RoutingRequest`; an unknown `dataRoutingPolicy` is named in the message. |
 | `401` | Missing or wrong `X-Infra-Api-Key`. |
-| `422` | No worker candidates; a hard `RoutingHints` constraint leaves no candidate; no message content to route on; `STRICT` policy and no Worker of a sufficient tier. |
+| `422` | No worker candidates; a hard `RoutingHints` constraint or the LOCAL-only requirement leaves no candidate (with a `code`, above); no message content to route on; `STRICT` policy and no Worker of a sufficient tier. |
 | `502` | The Laya call failed or returned a choice that was not offered. As in `router-spring-ai-example`, an AI failure is reported, not silently replaced by another algorithm. |
 
 Error bodies use the Spring Boot shape (`timestamp`, `status`, `error`, `message`, `path`).

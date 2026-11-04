@@ -6,12 +6,15 @@ import com.inframesh.node.dto.router.RoutingHints;
 import com.inframesh.node.dto.router.RoutingRequest;
 import com.inframesh.node.dto.router.WorkerCandidate;
 import com.inframesh.node.enums.ChatRole;
+import com.inframesh.node.enums.DataRoutingPolicy;
 import com.inframesh.node.enums.ExecutionLocation;
 import koboolean.layarouter.config.LayaRouterProperties.ModelCapabilityRule;
 import koboolean.layarouter.config.LayaRouterProperties;
 import koboolean.layarouter.laya.LayaTierClassifier;
 import koboolean.layarouter.laya.TierDecision;
 import koboolean.layarouter.laya.WorkerTier;
+import koboolean.layarouter.policy.DataRoutingGuard;
+import koboolean.layarouter.policy.SensitivityVerdict;
 import koboolean.layarouter.service.PromptBuilder;
 import koboolean.layarouter.service.WorkerSelector;
 import org.junit.jupiter.api.BeforeEach;
@@ -52,7 +55,9 @@ class LayaRouterServiceTest {
         properties.setModelCapabilities(List.of(
                 new ModelCapabilityRule("gemma3:4b", WorkerTier.SMALL),
                 new ModelCapabilityRule("qwen3:8b", WorkerTier.MEDIUM)));
-        service = new LayaRouterServiceImpl(classifier, new PromptBuilder(MESSAGE_ONLY), new WorkerSelector(properties), properties);
+        // DataRoutingPolicy is EXTERNAL_ALLOWED in these tests; DataRoutingPolicyTest covers the rest.
+        service = new LayaRouterServiceImpl(classifier, new PromptBuilder(MESSAGE_ONLY), new WorkerSelector(properties),
+                new DataRoutingGuard(request -> SensitivityVerdict.UNKNOWN), properties);
     }
 
     @Test
@@ -149,7 +154,8 @@ class LayaRouterServiceTest {
     }
 
     private static RoutingRequest request(List<ChatMessage> messages, RoutingHints hints, List<WorkerCandidate> workers) {
-        return new RoutingRequest("session-1", messages, null, hints, List.of(), null, workers);
+        return new RoutingRequest("session-1", messages, null, hints, List.of(), null, workers, null, null,
+                DataRoutingPolicy.EXTERNAL_ALLOWED);
     }
 
     private static WorkerCandidate worker(long workerId, String model) {

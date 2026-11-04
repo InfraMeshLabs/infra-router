@@ -5,6 +5,7 @@ import com.inframesh.node.dto.router.RoutingHints;
 import com.inframesh.node.dto.router.RoutingRequest;
 import com.inframesh.node.dto.router.RoutingResponse;
 import com.inframesh.node.dto.router.WorkerCandidate;
+import com.inframesh.node.enums.DataRoutingPolicy;
 import com.inframesh.node.enums.ExecutionLocation;
 import koboolean.jevrouter.client.JevClient;
 import koboolean.jevrouter.client.JevClientException;
@@ -47,7 +48,11 @@ import java.util.Optional;
  * summarizes the Worker's models - LOCAL, EXTERNAL, MIXED or UNKNOWN - and the instructions ask
  * Jev to prefer LOCAL Workers. Jev never sees the request messages: it is an external API, so
  * asking it whether the content may leave the organization would already have sent the content
- * out. Sensitive content is guarded only by the {@code privateData} hard filter here. The returned choice is trusted only if it
+ * out. Sensitive content is guarded only by the LOCAL-only hard filter here: {@code privateData},
+ * and {@code dataRoutingPolicy} INTERNAL_ONLY or AUTO (this Router has no sensitivity judge, so
+ * AUTO fails closed - as in the Laya Routers); only EXTERNAL_ALLOWED keeps other Workers. Jev is
+ * offered only the Workers left, and the selected Worker - Jev's or the fallback's - is checked
+ * against the filter again. The returned choice is trusted only if it
  * names a candidate that was actually offered; an unknown choice is treated exactly like a
  * failed call.
  * <p>
@@ -108,11 +113,22 @@ public class JevRoutingServiceImpl implements RouterService {
         RoutingHints hints = request.routing();
         List<WorkerCandidate> eligible = filterByRequiredProvider(candidates, hints);
         eligible = filterByGpuRequired(eligible, hints);
-        eligible = filterByPrivateData(eligible, hints);
+        Optional<LocalOnly> localOnly = localOnlyRequirement(request);
+        eligible = filterLocalOnly(eligible, localOnly);
         eligible = preferModel(eligible, hints);
 
         WorkerCandidate selected = selectWorker(eligible);
+        verifySelection(selected, localOnly.isPresent());
         return new RoutingResponse(selected.workerId());
+    }
+
+    // Last check on the Worker actually selected - failing it is a Router bug, never a reason to
+    // send the data out.
+    void verifySelection(WorkerCandidate selected, boolean localOnlyRequired) {
+        if (localOnlyRequired && !isLocalOnly(selected)) {
+            throw new ResponseStatusException(HttpStatus.INTERNAL_SERVER_ERROR,
+                    "Selected worker " + selected.workerId() + " is not LOCAL-only but the request requires it.");
+        }
     }
 
     // --- RoutingHints filtering (mirrors the other Router examples' hard-constraint policy) --
@@ -151,24 +167,42 @@ public class JevRoutingServiceImpl implements RouterService {
         return matched;
     }
 
-    private List<WorkerCandidate> filterByPrivateData(List<WorkerCandidate> candidates, RoutingHints hints) {
-        if (hints == null || !hints.isPrivateData()) {
+    // Same rule and codes as the Laya Routers' DataRoutingGuard: privateData wins under every
+    // policy; INTERNAL_ONLY and AUTO (no sensitivity judge here) keep LOCAL-only Workers;
+    // EXTERNAL_ALLOWED keeps everything. Empty = no restriction.
+    private Optional<LocalOnly> localOnlyRequirement(RoutingRequest request) {
+        if (request.routing() != null && request.routing().isPrivateData()) {
+            return Optional.of(new LocalOnly(RoutingRejectedException.PRIVATE_DATA_NO_LOCAL_WORKER,
+                    "privateData routing hint is set but no worker candidate is LOCAL-only."));
+        }
+        DataRoutingPolicy policy = request.dataRoutingPolicy() == null ? DataRoutingPolicy.AUTO : request.dataRoutingPolicy();
+        return switch (policy) {
+            case EXTERNAL_ALLOWED -> Optional.empty();
+            case INTERNAL_ONLY -> Optional.of(new LocalOnly(RoutingRejectedException.INTERNAL_ONLY_NO_LOCAL_WORKER,
+                    "dataRoutingPolicy is INTERNAL_ONLY but no worker candidate is LOCAL-only."));
+            case AUTO -> Optional.of(new LocalOnly(RoutingRejectedException.SENSITIVITY_UNVERIFIED_NO_LOCAL_WORKER,
+                    "The request could not be judged not sensitive and no worker candidate is LOCAL-only."));
+        };
+    }
+
+    private List<WorkerCandidate> filterLocalOnly(List<WorkerCandidate> candidates, Optional<LocalOnly> localOnly) {
+        if (localOnly.isEmpty()) {
             return candidates;
         }
 
         List<WorkerCandidate> matched = candidates.stream()
-                .filter(this::isSafeForPrivateData)
+                .filter(this::isLocalOnly)
                 .toList();
 
         if (matched.isEmpty()) {
-            throw new RoutingRejectedException(RoutingRejectedException.PRIVATE_DATA_NO_LOCAL_WORKER,
-                    "privateData routing hint is set but no worker candidate is LOCAL-only.");
+            throw new RoutingRejectedException(localOnly.get().code(), localOnly.get().reason());
         }
 
         return matched;
     }
 
-    private boolean isSafeForPrivateData(WorkerCandidate candidate) {
+    // Fail closed: no models, or any model that is not known to be LOCAL, is not LOCAL-only.
+    private boolean isLocalOnly(WorkerCandidate candidate) {
         List<ModelInfo> models = candidate.models();
         if (models == null || models.isEmpty()) {
             return false;
@@ -283,5 +317,9 @@ public class JevRoutingServiceImpl implements RouterService {
 
     private WorkerCandidate fallbackSelect(List<WorkerCandidate> eligible) {
         return eligible.stream().min(FALLBACK_ORDER).orElseThrow();
+    }
+
+    /** The request may only go to a LOCAL-only Worker; the refusal when none is left. */
+    private record LocalOnly(String code, String reason) {
     }
 }
