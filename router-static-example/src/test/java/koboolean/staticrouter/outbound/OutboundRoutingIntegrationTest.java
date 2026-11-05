@@ -6,6 +6,7 @@ import com.inframesh.node.dto.connection.NodeEnvelope;
 import com.inframesh.node.dto.router.ModelInfo;
 import com.inframesh.node.dto.router.RoutingRequest;
 import com.inframesh.node.dto.router.WorkerCandidate;
+import com.inframesh.node.enums.DataRoutingPolicy;
 import com.inframesh.node.enums.ExecutionLocation;
 import com.inframesh.node.enums.NodeMessageType;
 import org.junit.jupiter.api.AfterAll;
@@ -96,6 +97,41 @@ class OutboundRoutingIntegrationTest {
 
         JsonNode error = awaitEnvelope(NodeMessageType.ERROR, "route-empty");
         assertThat(error.path("payload").path("message").asString()).contains("No worker candidates");
+    }
+
+    // Same codes as DIRECT's 422 body (DataRoutingPolicyHttpContractTest), through NodeErrorCarrier.
+    @Test
+    void dataRoutingPolicyRefusal_isReportedWithItsCode() throws Exception {
+        WorkerCandidate external = new WorkerCandidate(2L, "worker-2", null,
+                List.of(new ModelInfo("OPENAI", "gpt-4o", ExecutionLocation.EXTERNAL)), "OPENAI", null, null,
+                0, 0, null, null, null, null, null, null, null, null, null, null, null);
+
+        CONSOLE.sendTextFrame(requestFrame("route-internal", new RoutingRequest(null, List.of(ChatMessage.user("hello")),
+                null, null, List.of(), null, List.of(external), null, null, DataRoutingPolicy.INTERNAL_ONLY)));
+        CONSOLE.sendTextFrame(requestFrame("route-auto", new RoutingRequest(
+                List.of(ChatMessage.user("hello")), null, null, List.of(external))));
+        CONSOLE.sendTextFrame(requestFrame("route-external", new RoutingRequest(null, List.of(ChatMessage.user("hello")),
+                null, null, List.of(), null, List.of(external), null, null, DataRoutingPolicy.EXTERNAL_ALLOWED)));
+
+        assertThat(awaitEnvelope(NodeMessageType.ERROR, "route-internal").path("payload").path("code").asString())
+                .isEqualTo("INTERNAL_ONLY_NO_LOCAL_WORKER");
+        assertThat(awaitEnvelope(NodeMessageType.ERROR, "route-auto").path("payload").path("code").asString())
+                .isEqualTo("SENSITIVITY_UNVERIFIED_NO_LOCAL_WORKER");
+        assertThat(awaitEnvelope(NodeMessageType.RESPONSE, "route-external").path("payload").path("workerId").asLong())
+                .isEqualTo(2L);
+    }
+
+    @Test
+    void unknownDataRoutingPolicy_isAMalformedPayload() throws Exception {
+        String frame = requestFrame("route-unknown", new RoutingRequest(
+                List.of(ChatMessage.user("hello")), null, null, List.of()))
+                .replace("\"dataRoutingPolicy\":\"AUTO\"", "\"dataRoutingPolicy\":\"SOMETIMES\"");
+        assertThat(frame).contains("SOMETIMES");
+
+        CONSOLE.sendTextFrame(frame);
+
+        assertThat(awaitEnvelope(NodeMessageType.ERROR, "route-unknown").path("payload").path("code").asString())
+                .isEqualTo("MALFORMED_PAYLOAD");
     }
 
     private static FakeConsoleServer startConsole() {

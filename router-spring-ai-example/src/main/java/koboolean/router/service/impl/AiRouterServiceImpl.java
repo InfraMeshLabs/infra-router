@@ -6,6 +6,7 @@ import com.inframesh.node.dto.router.RoutingHints;
 import com.inframesh.node.dto.router.RoutingRequest;
 import com.inframesh.node.dto.router.RoutingResponse;
 import com.inframesh.node.dto.router.WorkerCandidate;
+import com.inframesh.node.enums.DataRoutingPolicy;
 import com.inframesh.node.enums.ExecutionLocation;
 import koboolean.router.error.RoutingRejectedException;
 import koboolean.router.service.RouterService;
@@ -31,6 +32,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 
 /**
  * AI-native Worker selection.
@@ -52,6 +54,13 @@ import java.util.Map;
  * or a model with no {@code executionLocation}) — private routing fails closed rather
  * than trusting an unknown Worker.
  * <p>
+ * The Team's {@code dataRoutingPolicy} uses the same LOCAL-only filter, with the same rule and
+ * codes as the Laya Routers: {@code privateData} wins under every policy, INTERNAL_ONLY keeps
+ * LOCAL-only Workers, and so does AUTO (or a missing policy) - the model's {@code sensitiveData}
+ * comes back with its Worker choice, too late to decide which Workers it may be offered, so AUTO
+ * fails closed. Only EXTERNAL_ALLOWED offers the model other Workers. The filter runs before the
+ * model is called, and the selected Worker is checked against it again.
+ * <p>
  * The
  * remaining candidates — with every runtime field the Protocol provides, not a
  * hand-picked subset — are rendered into a prompt (loaded from {@code classpath:prompts},
@@ -59,12 +68,11 @@ import java.util.Map;
  * best.
  * <p>
  * The model also reports whether the request messages hold sensitive data (credentials,
- * personal data, ...) - it already reads them to pick a Worker, so asking costs no extra call
- * and sends the content nowhere new. A request it judges sensitive - or whose answer leaves the
- * judgement out, fail-closed - is held to the same rule as {@code privateData}: the chosen Worker
- * must be LOCAL-only. That is checked in code, not trusted: 422 with code
- * {@code SENSITIVE_DATA_NO_LOCAL_WORKER} ({@link RoutingRejectedException}) when no eligible
- * Worker is LOCAL-only, 502 when the model picked one that is not.
+ * personal data, ...), and the prompt asks it to choose a LOCAL-only Worker when they do - a
+ * preference inside its choice, like the rest of the prompt. The answer is logged but never
+ * refuses a request: the Workers the model may pick are already decided by the filter above, and
+ * under EXTERNAL_ALLOWED the Team has allowed other Workers. It is not the AUTO check either - it
+ * comes back with the Worker choice, after the candidates had to be narrowed.
  * <p>
  * The model's answer is never trusted blindly: it is accepted only if it names one of
  * the candidates that were actually offered. There is intentionally no automatic
@@ -117,7 +125,8 @@ public class AiRouterServiceImpl implements RouterService {
         RoutingHints hints = request.routing();
         List<WorkerCandidate> eligible = filterByRequiredProvider(candidates, hints);
         eligible = filterByGpuRequired(eligible, hints);
-        eligible = filterByPrivateData(eligible, hints);
+        Optional<LocalOnly> localOnly = localOnlyRequirement(request);
+        eligible = filterLocalOnly(eligible, localOnly);
 
         // Filtering already left exactly one option - no ambiguity to ask the model to
         // resolve. This is deterministic pre-selection, not a fallback for AI failure.
@@ -133,20 +142,11 @@ public class AiRouterServiceImpl implements RouterService {
                 .orElseThrow(() -> new ResponseStatusException(BAD_GATEWAY,
                         "The routing model selected a workerId that was not among the offered candidates: "
                                 + selection.workerId()));
+        verifySelection(selected, localOnly.isPresent());
 
-        // Fail closed: an answer that leaves the judgement out counts as sensitive.
-        boolean sensitive = !Boolean.FALSE.equals(selection.sensitiveData());
-        if (sensitive && !isSafeForPrivateData(selected)) {
-            if (eligible.stream().noneMatch(this::isSafeForPrivateData)) {
-                throw new RoutingRejectedException(RoutingRejectedException.SENSITIVE_DATA_NO_LOCAL_WORKER,
-                        "The routing model judged the request to contain sensitive data but no worker candidate is LOCAL-only.");
-            }
-            throw new ResponseStatusException(BAD_GATEWAY,
-                    "The routing model judged the request to contain sensitive data but selected a worker that is not LOCAL-only: "
-                            + selected.workerId());
-        }
-        log.info("event=routing_decision sessionId={} selectedWorkerId={} sensitiveData={}",
-                request.sessionId(), selected.workerId(), sensitive);
+        log.info("event=routing_decision sessionId={} dataRoutingPolicy={} localOnly={} selectedWorkerId={} sensitiveData={}",
+                request.sessionId(), policyOf(request), localOnly.map(LocalOnly::code).orElse(NONE),
+                selected.workerId(), selection.sensitiveData());
 
         return new RoutingResponse(selected.workerId());
     }
@@ -188,13 +188,34 @@ public class AiRouterServiceImpl implements RouterService {
         return matched;
     }
 
-    // privateData excludes a Worker entirely the moment any one of its models can run
+    private static DataRoutingPolicy policyOf(RoutingRequest request) {
+        return request.dataRoutingPolicy() == null ? DataRoutingPolicy.AUTO : request.dataRoutingPolicy();
+    }
+
+    // Same rule and codes as the Laya Routers' DataRoutingGuard: privateData wins under every
+    // policy; INTERNAL_ONLY and AUTO keep LOCAL-only Workers; EXTERNAL_ALLOWED keeps everything.
+    // Empty = no restriction.
+    private Optional<LocalOnly> localOnlyRequirement(RoutingRequest request) {
+        if (request.routing() != null && request.routing().isPrivateData()) {
+            return Optional.of(new LocalOnly(RoutingRejectedException.PRIVATE_DATA_NO_LOCAL_WORKER,
+                    "privateData routing hint is set but no worker candidate is LOCAL-only."));
+        }
+        return switch (policyOf(request)) {
+            case EXTERNAL_ALLOWED -> Optional.empty();
+            case INTERNAL_ONLY -> Optional.of(new LocalOnly(RoutingRejectedException.INTERNAL_ONLY_NO_LOCAL_WORKER,
+                    "dataRoutingPolicy is INTERNAL_ONLY but no worker candidate is LOCAL-only."));
+            case AUTO -> Optional.of(new LocalOnly(RoutingRejectedException.SENSITIVITY_UNVERIFIED_NO_LOCAL_WORKER,
+                    "The request could not be judged not sensitive and no worker candidate is LOCAL-only."));
+        };
+    }
+
+    // The LOCAL-only filter excludes a Worker entirely the moment any one of its models can run
     // EXTERNAL - a Worker choosing Qwen(LOCAL) or GPT(EXTERNAL) internally is just as
     // unsafe as one offering only GPT, since the Router cannot constrain that choice.
     // Unknown safety (no models, or a model with a null executionLocation) is treated
     // as unsafe rather than passed through, per fail-closed policy.
-    private List<WorkerCandidate> filterByPrivateData(List<WorkerCandidate> candidates, RoutingHints hints) {
-        if (hints == null || !hints.isPrivateData()) {
+    private List<WorkerCandidate> filterLocalOnly(List<WorkerCandidate> candidates, Optional<LocalOnly> localOnly) {
+        if (localOnly.isEmpty()) {
             return candidates;
         }
 
@@ -203,11 +224,19 @@ public class AiRouterServiceImpl implements RouterService {
                 .toList();
 
         if (matched.isEmpty()) {
-            throw new RoutingRejectedException(RoutingRejectedException.PRIVATE_DATA_NO_LOCAL_WORKER,
-                    "privateData routing hint is set but no worker candidate is LOCAL-only.");
+            throw new RoutingRejectedException(localOnly.get().code(), localOnly.get().reason());
         }
 
         return matched;
+    }
+
+    // Last check on the Worker actually selected - failing it is a Router bug, never a reason to
+    // send the data out.
+    void verifySelection(WorkerCandidate selected, boolean localOnlyRequired) {
+        if (localOnlyRequired && !isSafeForPrivateData(selected)) {
+            throw new ResponseStatusException(HttpStatus.INTERNAL_SERVER_ERROR,
+                    "Selected worker " + selected.workerId() + " is not LOCAL-only but the request requires it.");
+        }
     }
 
     private boolean isSafeForPrivateData(WorkerCandidate candidate) {
@@ -319,5 +348,9 @@ public class AiRouterServiceImpl implements RouterService {
     }
 
     private record WorkerSelection(Long workerId, Boolean sensitiveData) {
+    }
+
+    /** The request may only go to a LOCAL-only Worker; the refusal when none is left. */
+    private record LocalOnly(String code, String reason) {
     }
 }
