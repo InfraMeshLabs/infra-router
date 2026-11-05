@@ -5,6 +5,7 @@ import com.inframesh.node.dto.router.RoutingHints;
 import com.inframesh.node.dto.router.RoutingRequest;
 import com.inframesh.node.dto.router.RoutingResponse;
 import com.inframesh.node.dto.router.WorkerCandidate;
+import com.inframesh.node.enums.DataRoutingPolicy;
 import com.inframesh.node.enums.ExecutionLocation;
 import koboolean.staticrouter.config.StaticRouterProperties;
 import koboolean.staticrouter.config.StaticRouterWeights;
@@ -21,6 +22,7 @@ import java.math.MathContext;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.function.Function;
 
 /**
@@ -54,12 +56,14 @@ import java.util.function.Function;
  * that Worker's remaining metrics. A Worker that reports no metric at all is scored as fully
  * loaded, as Console's own LEAST_BUSY strategy does: unknown load is never assumed to be idle.
  * <p>
- * Where a Worker runs its models ({@code ModelInfo.executionLocation}) is scored too. Without
- * {@code privateData} an EXTERNAL Worker stays eligible, but a Worker that is not LOCAL-only -
- * any EXTERNAL model, or a model or Worker whose location is unknown - has
+ * Where a Worker runs its models ({@code ModelInfo.executionLocation}) decides whether it is
+ * eligible at all: {@code privateData}, {@code dataRoutingPolicy} INTERNAL_ONLY and AUTO (this
+ * Router has no sensitivity judge, so AUTO fails closed - as in the Laya Routers) keep only
+ * LOCAL-only Workers, and the selected Worker is checked against that again. Only
+ * EXTERNAL_ALLOWED without {@code privateData} keeps a Worker that is not LOCAL-only - any
+ * EXTERNAL model, or a model or Worker whose location is unknown - and it gets
  * {@code router.static.external-penalty} added to its score: the request data may leave to an
- * outside AI provider, so such a Worker wins only when it is clearly less loaded. With
- * {@code privateData} it is not eligible at all.
+ * outside AI provider, so such a Worker wins only when it is clearly less loaded.
  * <p>
  * {@code throughput} and {@code errorCount} are deliberately not scored: Console does not
  * populate them yet, and {@code errorCount} is a lifetime total that would penalize a Worker
@@ -94,11 +98,22 @@ public class StaticRouterServiceImpl implements RouterService {
         RoutingHints hints = request.routing();
         List<WorkerCandidate> eligible = filterByRequiredProvider(candidates, hints);
         eligible = filterByGpuRequired(eligible, hints);
-        eligible = filterByPrivateData(eligible, hints);
+        Optional<LocalOnly> localOnly = localOnlyRequirement(request);
+        eligible = filterLocalOnly(eligible, localOnly);
         eligible = preferModel(eligible, hints);
 
         WorkerCandidate selected = selectByScore(eligible);
+        verifySelection(selected, localOnly.isPresent());
         return new RoutingResponse(selected.workerId());
+    }
+
+    // Last check on the Worker actually selected - failing it is a Router bug, never a reason to
+    // send the data out.
+    void verifySelection(WorkerCandidate selected, boolean localOnlyRequired) {
+        if (localOnlyRequired && !isLocalOnly(selected)) {
+            throw new ResponseStatusException(HttpStatus.INTERNAL_SERVER_ERROR,
+                    "Selected worker " + selected.workerId() + " is not LOCAL-only but the request requires it.");
+        }
     }
 
     // --- RoutingHints filtering (mirrors AiRouterServiceImpl's hard-constraint policy) --
@@ -137,24 +152,43 @@ public class StaticRouterServiceImpl implements RouterService {
         return matched;
     }
 
-    private List<WorkerCandidate> filterByPrivateData(List<WorkerCandidate> candidates, RoutingHints hints) {
-        if (hints == null || !hints.isPrivateData()) {
+    // Same rule and codes as the Laya Routers' DataRoutingGuard: privateData wins under every
+    // policy; INTERNAL_ONLY and AUTO (no sensitivity judge here) keep LOCAL-only Workers;
+    // EXTERNAL_ALLOWED keeps everything. Empty = no restriction.
+    private Optional<LocalOnly> localOnlyRequirement(RoutingRequest request) {
+        if (request.routing() != null && request.routing().isPrivateData()) {
+            return Optional.of(new LocalOnly(RoutingRejectedException.PRIVATE_DATA_NO_LOCAL_WORKER,
+                    "privateData routing hint is set but no worker candidate is LOCAL-only."));
+        }
+        DataRoutingPolicy policy = request.dataRoutingPolicy() == null ? DataRoutingPolicy.AUTO : request.dataRoutingPolicy();
+        return switch (policy) {
+            case EXTERNAL_ALLOWED -> Optional.empty();
+            case INTERNAL_ONLY -> Optional.of(new LocalOnly(RoutingRejectedException.INTERNAL_ONLY_NO_LOCAL_WORKER,
+                    "dataRoutingPolicy is INTERNAL_ONLY but no worker candidate is LOCAL-only."));
+            case AUTO -> Optional.of(new LocalOnly(RoutingRejectedException.SENSITIVITY_UNVERIFIED_NO_LOCAL_WORKER,
+                    "The request could not be judged not sensitive and no worker candidate is LOCAL-only."));
+        };
+    }
+
+    private List<WorkerCandidate> filterLocalOnly(List<WorkerCandidate> candidates,
+                                                  Optional<LocalOnly> localOnly) {
+        if (localOnly.isEmpty()) {
             return candidates;
         }
 
         List<WorkerCandidate> matched = candidates.stream()
-                .filter(this::isSafeForPrivateData)
+                .filter(this::isLocalOnly)
                 .toList();
 
         if (matched.isEmpty()) {
-            throw new RoutingRejectedException(RoutingRejectedException.PRIVATE_DATA_NO_LOCAL_WORKER,
-                    "privateData routing hint is set but no worker candidate is LOCAL-only.");
+            throw new RoutingRejectedException(localOnly.get().code(), localOnly.get().reason());
         }
 
         return matched;
     }
 
-    private boolean isSafeForPrivateData(WorkerCandidate candidate) {
+    // Fail closed: no models, or any model that is not known to be LOCAL, is not LOCAL-only.
+    private boolean isLocalOnly(WorkerCandidate candidate) {
         List<ModelInfo> models = candidate.models();
         if (models == null || models.isEmpty()) {
             return false;
@@ -241,7 +275,7 @@ public class StaticRouterServiceImpl implements RouterService {
         // weight is renormalized to sum to 1 - see the class-level note. A candidate with
         // no available metric at all is scored as fully loaded.
         double loadScore = availableWeight > 0 ? weightedSum / availableWeight : UNKNOWN_LOAD_SCORE;
-        boolean localOnly = isSafeForPrivateData(candidate);
+        boolean localOnly = isLocalOnly(candidate);
         double score = localOnly ? loadScore : loadScore + externalPenalty;
 
         return new ScoredCandidate(candidate, normalizedRequestCount, normalizedQueueSize,
@@ -302,6 +336,10 @@ public class StaticRouterServiceImpl implements RouterService {
             .thenComparing(s -> s.candidate.currentRequestCount() == null ? Integer.MAX_VALUE : s.candidate.currentRequestCount())
             .thenComparing(s -> s.candidate.averageLatency() == null ? BigDecimal.valueOf(Long.MAX_VALUE) : s.candidate.averageLatency())
             .thenComparing(s -> s.candidate.workerId());
+
+    /** The request may only go to a LOCAL-only Worker; the refusal when none is left. */
+    private record LocalOnly(String code, String reason) {
+    }
 
     private record ScoredCandidate(
             WorkerCandidate candidate,

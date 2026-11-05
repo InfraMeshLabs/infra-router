@@ -6,6 +6,7 @@ import com.inframesh.node.dto.router.RoutingHints;
 import com.inframesh.node.dto.router.RoutingRequest;
 import com.inframesh.node.dto.router.RoutingResponse;
 import com.inframesh.node.dto.router.WorkerCandidate;
+import com.inframesh.node.enums.DataRoutingPolicy;
 import com.inframesh.node.enums.ExecutionLocation;
 import koboolean.staticrouter.config.StaticRouterProperties;
 import koboolean.staticrouter.config.StaticRouterWeights;
@@ -126,7 +127,7 @@ class StaticRouterServiceTest {
         WorkerCandidate local = withLoad(candidateWithModel(1L, local("OLLAMA", "qwen3")), 4);
         WorkerCandidate external = withLoad(candidateWithModel(2L, external("OPENAI", "gpt-4o")), 3);
 
-        RoutingResponse response = service.route(routingRequest(null, List.of(local, external)));
+        RoutingResponse response = service.route(externalAllowed(List.of(local, external)));
 
         assertThat(response.workerId()).isEqualTo(1L);
     }
@@ -136,7 +137,7 @@ class StaticRouterServiceTest {
         WorkerCandidate local = withLoad(candidateWithModel(1L, local("OLLAMA", "qwen3")), 10);
         WorkerCandidate external = withLoad(candidateWithModel(2L, external("OPENAI", "gpt-4o")), 0);
 
-        RoutingResponse response = service.route(routingRequest(null, List.of(local, external)));
+        RoutingResponse response = service.route(externalAllowed(List.of(local, external)));
 
         assertThat(response.workerId()).isEqualTo(2L);
     }
@@ -146,7 +147,7 @@ class StaticRouterServiceTest {
         WorkerCandidate local = withLoad(candidateWithModel(1L, local("OLLAMA", "qwen3")), 4);
         WorkerCandidate unknown = withLoad(candidateWithModel(2L, new ModelInfo("OLLAMA", "qwen3", null)), 3);
 
-        RoutingResponse response = service.route(routingRequest(null, List.of(local, unknown)));
+        RoutingResponse response = service.route(externalAllowed(List.of(local, unknown)));
 
         assertThat(response.workerId()).isEqualTo(1L);
     }
@@ -324,6 +325,13 @@ class StaticRouterServiceTest {
                 c.framework(), c.frameworkVersion(), requestCount, c.queueSize(), c.averageLatency(), c.throughput(),
                 c.errorCount(), c.cpu(), c.cpuUsage(), c.memory(), c.memoryUsage(), c.gpu(), c.gpuUsage(), c.vram(),
                 c.vramUsage());
+    }
+
+    // The external-penalty tests need non-LOCAL Workers to stay eligible: without a policy (AUTO)
+    // this Router keeps LOCAL-only Workers only - see StaticDataRoutingPolicyTest.
+    private RoutingRequest externalAllowed(List<WorkerCandidate> workers) {
+        return new RoutingRequest(null, List.of(ChatMessage.user("hello")), null, null, List.of(), null, workers,
+                null, null, DataRoutingPolicy.EXTERNAL_ALLOWED);
     }
 
     private RoutingRequest routingRequest(RoutingHints hints, List<WorkerCandidate> workers) {
